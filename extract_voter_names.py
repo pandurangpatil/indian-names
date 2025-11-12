@@ -8,9 +8,8 @@ Output format: Name (नाव), Husband/Father Name (पतीचे नाव 
 import re
 import argparse
 import pdfplumber
-import pandas as pd
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List, Tuple
 import pytesseract
 import sys
 from datetime import datetime
@@ -46,10 +45,11 @@ OCR_CORRECTIONS = {
 
 
 class ErrorLogger:
-    """Logger for tracking extraction errors."""
+    """Logger for tracking extraction errors and rejected names."""
 
     def __init__(self, output_path: str):
         self.errors = []
+        self.rejected_names = []
         self.output_path = output_path
 
     def log_error(self, pdf_file: str, page_num: int, raw_text: str, reason: str):
@@ -61,24 +61,48 @@ class ErrorLogger:
             'reason': reason
         })
 
+    def log_rejected_name(self, pdf_file: str, page_num: int, name: str, reason: str):
+        """Log a rejected name with reason."""
+        self.rejected_names.append({
+            'pdf_file': pdf_file,
+            'page_number': page_num,
+            'name': name,
+            'reason': reason
+        })
+
     def save(self):
-        """Save errors to file."""
-        if self.errors:
+        """Save errors and rejected names to file."""
+        if self.errors or self.rejected_names:
             with open(self.output_path, 'w', encoding='utf-8') as f:
                 f.write("=" * 80 + "\n")
-                f.write("EXTRACTION ERRORS LOG\n")
+                f.write("EXTRACTION ERRORS AND REJECTED NAMES LOG\n")
                 f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
                 f.write("=" * 80 + "\n\n")
 
-                for idx, error in enumerate(self.errors, 1):
-                    f.write(f"\n--- Error #{idx} ---\n")
-                    f.write(f"File: {error['pdf_file']}\n")
-                    f.write(f"Page: {error['page_number']}\n")
-                    f.write(f"Reason: {error['reason']}\n")
-                    f.write(f"Raw Text:\n{error['raw_text']}\n")
-                    f.write("-" * 80 + "\n")
+                if self.errors:
+                    f.write(f"EXTRACTION ERRORS ({len(self.errors)} total)\n")
+                    f.write("=" * 80 + "\n")
+                    for idx, error in enumerate(self.errors, 1):
+                        f.write(f"\n--- Error #{idx} ---\n")
+                        f.write(f"File: {error['pdf_file']}\n")
+                        f.write(f"Page: {error['page_number']}\n")
+                        f.write(f"Reason: {error['reason']}\n")
+                        f.write(f"Raw Text:\n{error['raw_text']}\n")
+                        f.write("-" * 80 + "\n")
 
-            print(f"  ⚠ Logged {len(self.errors)} errors to: {self.output_path}")
+                if self.rejected_names:
+                    f.write(f"\n\nREJECTED NAMES ({len(self.rejected_names)} total)\n")
+                    f.write("=" * 80 + "\n")
+                    for idx, rejected in enumerate(self.rejected_names, 1):
+                        f.write(f"\n--- Rejected #{idx} ---\n")
+                        f.write(f"File: {rejected['pdf_file']}\n")
+                        f.write(f"Page: {rejected['page_number']}\n")
+                        f.write(f"Name: {rejected['name']}\n")
+                        f.write(f"Reason: {rejected['reason']}\n")
+                        f.write("-" * 80 + "\n")
+
+            total = len(self.errors) + len(self.rejected_names)
+            print(f"  ⚠ Logged {total} issues to: {self.output_path}")
 
 
 def apply_ocr_corrections(text: str) -> str:
@@ -101,6 +125,59 @@ def is_label_only(text: str) -> bool:
             return True
 
     return False
+
+
+def is_valid_devanagari_name(name: str) -> Tuple[bool, str]:
+    """
+    Strictly validate if text is a valid Devanagari name.
+
+    Returns:
+        Tuple of (is_valid, rejection_reason)
+    """
+    name = name.strip()
+
+    # Check minimum length
+    if len(name) < 3:
+        return False, "Too short (less than 3 characters)"
+
+    # Check if it's only a label
+    if is_label_only(name):
+        return False, "Label only (not a name)"
+
+    # Check for English letters
+    if re.search(r'[a-zA-Z]', name):
+        return False, "Contains English characters"
+
+    # Check for numbers (except in rare cases where numbers might be part of name)
+    if re.search(r'\d', name):
+        return False, "Contains numbers"
+
+    # Check for special characters (allow only Devanagari and basic punctuation)
+    # Devanagari range: U+0900–U+097F
+    # Allow: space, apostrophe ('), hyphen (-), comma (,)
+    allowed_pattern = r'^[\u0900-\u097F\s\'\-,]+$'
+    if not re.match(allowed_pattern, name):
+        return False, "Contains invalid special characters"
+
+    # Check for known OCR artifacts
+    ocr_artifacts = ['att', 'eae', 'BT', 'donee', 'HATTERAS', 'HSS', 'decor',
+                     'Fife', 'Orde', 'Sea', 'Bett', 'Fretar', 'ord', 'ga', 'Sta',
+                     'Fart', 'Fert', 'fem', 'feat', 'fear', 'mare', 'ara', 'aa']
+    for artifact in ocr_artifacts:
+        if artifact in name:
+            return False, f"OCR artifact detected: '{artifact}'"
+
+    # Check if it's mostly punctuation
+    if len(re.findall(r'[\u0900-\u097F]', name)) < 3:
+        return False, "Insufficient Devanagari characters"
+
+    # Check for excessive punctuation
+    punctuation_count = len(re.findall(r'[\'\-,;:|]', name))
+    char_count = len(name.replace(' ', ''))
+    if char_count > 0 and punctuation_count / char_count > 0.3:
+        return False, "Excessive punctuation"
+
+    return True, ""
 
 
 def has_excessive_ocr_errors(text: str) -> bool:
@@ -160,10 +237,10 @@ def extract_name_from_line(line: str, label_pattern: str) -> str:
     return ""
 
 
-def extract_voter_from_text_block(text: str, pdf_file: str, page_num: int, error_logger: ErrorLogger, _retry: bool = False) -> List[Dict[str, str]]:
+def extract_voter_from_text_block(text: str, pdf_file: str, page_num: int, error_logger: ErrorLogger, _retry: bool = False) -> List[str]:
     """
-    Extract voter name and relationship name from a text block.
-    Handles cases where multiple voters appear on the same line (side-by-side in PDF).
+    Extract ALL names from a text block (voters, husbands, fathers, mothers, wives).
+    Each name is returned as a separate entry.
 
     Args:
         text: Text block from a voter card
@@ -173,17 +250,14 @@ def extract_voter_from_text_block(text: str, pdf_file: str, page_num: int, error
         _retry: Internal flag to prevent infinite recursion
 
     Returns:
-        List of extracted voter dictionaries
+        List of extracted names (strings)
     """
-    voters = []
+    all_names = []
 
     # Split into lines
     lines = [line.strip() for line in text.split('\n') if line.strip()]
 
-    # Find name lines and relationship lines
-    name_lines = []
-    relationship_lines = []
-
+    # Find all name lines (both voter names and relationship names)
     for line in lines:
         # Skip lines that are clearly not names
         if any(skip in line for skip in ['घर क्रमाक', 'वय :', 'लिंग :', 'छायाचित्र', 'उपलब्ध', 'यादी भाग', 'दिनांकास', 'विधानसभा', 'विभाग क्रमांक']):
@@ -193,105 +267,54 @@ def extract_voter_from_text_block(text: str, pdf_file: str, page_num: int, error
         if re.match(r'^[\dA-Z\s\-]+$', line.strip()) and len(line.strip()) < 20:
             continue
 
-        # Check if this line contains voter names
+        # Check if this line contains any names with "नाव" pattern
         if ('नाव' in line or 'नाब' in line) and (':' in line or ';' in line):
-            # Check if it's the main name line (not relationship name line)
-            if any(rel in line for rel in ['पतीचे', 'पत्नीचे', 'वडिलांचे', 'आईचे', 'बडिलांचे', 'पत्तीचे', 'चे नाव', 'चडिलांचे']):
-                # This is a relationship name line
-                relationship_lines.append(line)
-            else:
-                # This is a voter name line
-                name_lines.append(line)
+            # Try to extract names from this line
+            # Handle multiple names on one line (side-by-side cards)
 
-    # Handle case where multiple voters are on one line (side-by-side cards)
-    # Pattern: "नाव : Person1 नाव ; Person2 नाव : Person3"
-    all_voter_names = []
-    all_relationship_names = []
+            # Split by "नाव" occurrences to separate multiple entries
+            parts = re.split(r'(?=(?:पतीचे\s*)?(?:वडिलांचे\s*)?(?:पत्नीचे\s*)?(?:आईचे\s*)?(?:नाव|नाब)\s*[:;])', line)
 
-    for name_line in name_lines:
-        # Split by "नाव" occurrences to separate multiple voters
-        # Use lookahead to keep "नाव" in the results
-        parts = re.split(r'(?=नाव\s*[:;])', name_line)
+            for part in parts:
+                if 'नाव' in part or 'नाब' in part:
+                    # Try different label patterns
+                    name = None
+                    for label in ['पतीचे', 'वडिलांचे', 'पत्नीचे', 'आईचे', 'नाव', 'नाब']:
+                        if label in part:
+                            extracted = extract_name_from_line(part, label)
+                            if extracted:
+                                name = extracted
+                                break
 
-        for part in parts:
-            if 'नाव' in part:
-                name = extract_name_from_line(part, 'नाव')
-                if not name and 'नाब' in part:
-                    name = extract_name_from_line(part, 'नाब')
+                    if name:
+                        # Clean up the name
+                        name = re.sub(r'^\s*(नाव|नाब|पतीचे|वडिलांचे|पत्नीचे|आईचे)\s*[:;]\s*', '', name)
+                        name = re.sub(r'\s+', ' ', name).strip()
+                        # Remove OCR artifacts
+                        name = re.sub(r'\s*(att|Fart|Fert)\s*', ' ', name).strip()
+                        name = re.sub(r'\s+', ' ', name).strip()
+                        # Remove prefixes like 'ः' or other punctuation
+                        name = re.sub(r'^[:\s;]+', '', name).strip()
 
-                if name and not is_label_only(name) and not has_excessive_ocr_errors(name):
-                    all_voter_names.append(name)
+                        # Validate the name
+                        is_valid, rejection_reason = is_valid_devanagari_name(name)
 
-    for rel_line in relationship_lines:
-        # Split by relationship patterns to handle multiple relationships on one line
-        # Pattern: "पतीचे नाव: Name1 वडिलांचे नाव: Name2 पतीचे नाव: Name3"
-
-        # Find all relationship patterns and their positions
-        rel_matches = []
-        for rel_pattern in ['पतीचे नाव', 'वडिलांचे नाव', 'पत्नीचे नाव', 'आईचे नाव', 'पत्तीचे नाव', 'चडिलांचे नाव', 'चे नाव']:
-            for match in re.finditer(rf'{rel_pattern}\s*[:;]?\s*', rel_line):
-                rel_matches.append((match.start(), match.end(), rel_pattern))
-
-        # Sort by position
-        rel_matches.sort(key=lambda x: x[0])
-
-        # Extract each relationship name
-        for i, (start, end, pattern) in enumerate(rel_matches):
-            # Get text until next pattern or end of line
-            if i < len(rel_matches) - 1:
-                next_start = rel_matches[i + 1][0]
-                text_part = rel_line[end:next_start]
-            else:
-                text_part = rel_line[end:]
-
-            # Clean and extract the name
-            rel_name = text_part.strip()
-            # Remove any trailing patterns
-            rel_name = re.sub(r'\s+(छायाचित्र|घर क्रमांक|उपलब्ध).*$', '', rel_name)
-            rel_name = re.sub(r'\s+', ' ', rel_name).strip()
-
-            if rel_name and len(rel_name) > 2 and not is_label_only(rel_name) and not has_excessive_ocr_errors(rel_name):
-                all_relationship_names.append(rel_name)
-
-    # Match voters with their relationship names
-    # Typically, they appear in the same order on consecutive lines
-    for i in range(len(all_voter_names)):
-        voter_name = all_voter_names[i]
-        relationship_name = all_relationship_names[i] if i < len(all_relationship_names) else ""
-
-        # Clean up names
-        voter_name = re.sub(r'^\s*(नाव|नाब)\s*[:;]\s*', '', voter_name)
-        voter_name = re.sub(r'\s+', ' ', voter_name).strip()
-        # Remove OCR artifacts
-        voter_name = re.sub(r'\s*(att|Fart|Fert)\s*', ' ', voter_name).strip()
-        voter_name = re.sub(r'\s+', ' ', voter_name).strip()
-
-        if relationship_name:
-            relationship_name = re.sub(r'^\s*(नाव|नाब)\s*[:;]\s*', '', relationship_name)
-            relationship_name = re.sub(r'\s+', ' ', relationship_name).strip()
-            # Remove OCR artifacts
-            relationship_name = re.sub(r'\s*(att|Fart|Fert)\s*', ' ', relationship_name).strip()
-            relationship_name = re.sub(r'\s+', ' ', relationship_name).strip()
-            # Remove prefixes like 'ः' (colon in Marathi) or other punctuation
-            relationship_name = re.sub(r'^[:\s;]+', '', relationship_name).strip()
-
-        if len(voter_name) > 2 and not re.match(r'^\d+\s*$', voter_name):  # Not just numbers
-            voters.append({
-                'name': voter_name,
-                'relationship_name': relationship_name
-            })
+                        if is_valid:
+                            all_names.append(name)
+                        elif name and len(name) >= 3:  # Only log if it's substantial enough
+                            error_logger.log_rejected_name(pdf_file, page_num, name, rejection_reason)
 
     # Log errors for problematic extractions
-    if not voters and text and 'नाव' in text and not _retry:
+    if not all_names and text and 'नाव' in text and not _retry:
         # Only try correction once to avoid recursion
         corrected_text = apply_ocr_corrections(text)
         if corrected_text != text:
             return extract_voter_from_text_block(corrected_text, pdf_file, page_num, error_logger, _retry=True)
         else:
             # Only log if there was 'नाव' in the text but we couldn't extract
-            error_logger.log_error(pdf_file, page_num, text, "Could not extract voter name from text block")
+            error_logger.log_error(pdf_file, page_num, text, "Could not extract any names from text block")
 
-    return voters
+    return all_names
 
 
 def detect_voter_card_boxes(page) -> List[Tuple[float, float, float, float]]:
@@ -353,7 +376,7 @@ def detect_voter_card_boxes(page) -> List[Tuple[float, float, float, float]]:
     return boxes
 
 
-def extract_voters_from_page(page, page_num: int, pdf_file: str, error_logger: ErrorLogger) -> List[Dict[str, str]]:
+def extract_voters_from_page(page, page_num: int, pdf_file: str, error_logger: ErrorLogger) -> List[str]:
     """
     Extract voter information from a PDF page using OCR and text parsing.
 
@@ -364,9 +387,9 @@ def extract_voters_from_page(page, page_num: int, pdf_file: str, error_logger: E
         error_logger: Error logger instance
 
     Returns:
-        List of voter dictionaries
+        List of extracted names
     """
-    voters = []
+    names = []
 
     # Try text extraction first
     text = page.extract_text()
@@ -424,13 +447,13 @@ def extract_voters_from_page(page, page_num: int, pdf_file: str, error_logger: E
     # Process each block
     for block in blocks:
         if block.strip() and 'नाव' in block:
-            block_voters = extract_voter_from_text_block(block, pdf_file, page_num, error_logger)
-            voters.extend(block_voters)
+            block_names = extract_voter_from_text_block(block, pdf_file, page_num, error_logger)
+            names.extend(block_names)
 
-    return voters
+    return names
 
 
-def extract_voters_from_pdf(pdf_path: str, start_page: int, end_page: int, error_logger: ErrorLogger) -> pd.DataFrame:
+def extract_voters_from_pdf(pdf_path: str, start_page: int, end_page: int, error_logger: ErrorLogger) -> List[str]:
     """
     Extract voter names from PDF file using spatial parsing.
 
@@ -441,9 +464,9 @@ def extract_voters_from_pdf(pdf_path: str, start_page: int, end_page: int, error
         error_logger: Error logger instance
 
     Returns:
-        pandas DataFrame with extracted voter information
+        List of extracted names
     """
-    all_voters = []
+    all_names = []
     pdf_file = Path(pdf_path).name
 
     with pdfplumber.open(pdf_path) as pdf:
@@ -454,11 +477,11 @@ def extract_voters_from_pdf(pdf_path: str, start_page: int, end_page: int, error
             print(f"    Page {page_num + 1}/{actual_end}...", end=" ")
             page = pdf.pages[page_num]
 
-            voters = extract_voters_from_page(page, page_num + 1, pdf_file, error_logger)
-            all_voters.extend(voters)
-            print(f"{len(voters)} names")
+            names = extract_voters_from_page(page, page_num + 1, pdf_file, error_logger)
+            all_names.extend(names)
+            print(f"{len(names)} names")
 
-    return pd.DataFrame(all_voters)
+    return all_names
 
 
 def process_folder(folder_path: Path, start_page: int, end_page: int, output_file: str) -> None:
@@ -478,16 +501,17 @@ def process_folder(folder_path: Path, start_page: int, end_page: int, output_fil
         return
 
     print("=" * 80)
-    print(f"Maharashtra Voter Name Extractor (Spatial Parsing)")
+    print(f"Maharashtra Voter Name Extractor - All Names")
     print("=" * 80)
     print(f"Folder: {folder_path}")
     print(f"Found {len(pdf_files)} PDF file(s)")
     print(f"Extracting pages: {start_page} to {end_page}")
-    print(f"Output format: Name, Husband/Father Name")
+    print(f"Output format: Plain text (one name per line)")
+    print(f"Validation: Strict Devanagari only")
     print("=" * 80)
 
     # Initialize error logger
-    error_file = output_file.replace('.csv', '_errors.txt')
+    error_file = output_file.replace('.txt', '_errors.txt').replace('.csv', '_errors.txt')
     error_logger = ErrorLogger(error_file)
 
     all_names = []
@@ -497,11 +521,11 @@ def process_folder(folder_path: Path, start_page: int, end_page: int, output_fil
     for idx, pdf_file in enumerate(pdf_files, 1):
         print(f"\n[{idx}/{len(pdf_files)}] Processing: {pdf_file.name}")
         try:
-            df = extract_voters_from_pdf(str(pdf_file), start_page, end_page, error_logger)
+            names = extract_voters_from_pdf(str(pdf_file), start_page, end_page, error_logger)
 
-            if not df.empty:
-                all_names.append(df)
-                print(f"  ✓ Extracted {len(df)} names")
+            if names:
+                all_names.extend(names)
+                print(f"  ✓ Extracted {len(names)} names")
                 successful += 1
             else:
                 print(f"  ⚠ No names extracted")
@@ -516,18 +540,18 @@ def process_folder(folder_path: Path, start_page: int, end_page: int, output_fil
     # Save error log
     error_logger.save()
 
-    # Combine all results
+    # Combine all results and remove duplicates
     if all_names:
-        final_df = pd.concat(all_names, ignore_index=True)
+        initial_count = len(all_names)
 
-        # Remove duplicates
-        initial_count = len(final_df)
-        final_df = final_df.drop_duplicates()
-        duplicates_removed = initial_count - len(final_df)
+        # Remove duplicates while preserving order
+        unique_names = list(dict.fromkeys(all_names))
+        duplicates_removed = initial_count - len(unique_names)
 
-        # Save to CSV with new column names
-        final_df.columns = ['Name (नाव)', 'Husband/Father Name (पतीचे नाव / वडिलांचे नाव)']
-        final_df.to_csv(output_file, index=False, encoding='utf-8-sig')
+        # Save to TXT file
+        with open(output_file, 'w', encoding='utf-8') as f:
+            for name in unique_names:
+                f.write(name + '\n')
 
         print("\n" + "=" * 80)
         print("EXTRACTION COMPLETE")
@@ -536,17 +560,15 @@ def process_folder(folder_path: Path, start_page: int, end_page: int, output_fil
         print(f"✗ Failed: {failed}")
         print(f"✓ Total names extracted: {initial_count}")
         print(f"✓ Duplicates removed: {duplicates_removed}")
-        print(f"✓ Unique names: {len(final_df)}")
+        print(f"✓ Unique names: {len(unique_names)}")
         print(f"✓ Output saved to: {output_file}")
         print("=" * 80)
 
         # Display sample
-        print("\nSample of extracted names (first 10):")
+        print("\nSample of extracted names (first 15):")
         print("-" * 80)
-        pd.set_option('display.max_columns', None)
-        pd.set_option('display.width', 120)
-        pd.set_option('display.max_colwidth', 50)
-        print(final_df.head(10).to_string(index=False))
+        for name in unique_names[:15]:
+            print(f"  {name}")
         print("-" * 80)
 
     else:
@@ -577,7 +599,7 @@ Examples:
         '-o', '--output',
         type=str,
         default=None,
-        help='Output CSV filename (default: extracted_names_<timestamp>.csv)'
+        help='Output TXT filename (default: extracted_names_<timestamp>.txt)'
     )
 
     parser.add_argument(
@@ -603,7 +625,7 @@ Examples:
         output_file = args.output
     else:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        output_file = f"extracted_names_{timestamp}.csv"
+        output_file = f"extracted_names_{timestamp}.txt"
 
     # Get folder path
     folder_path = Path(args.folder).resolve()

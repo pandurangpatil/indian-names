@@ -1,0 +1,11 @@
+# Indian Names - Maharashtra Voter Name Extractor
+# Python 3.8+ required
+
+# Core dependencies
+pdfplumber==0.11.4      # PDF text extraction with spatial awareness
+pytesseract==0.3.13     # Python wrapper for Tesseract OCR
+Pillow==11.0.0          # Image processing for OCR
+
+# System requirements (not installed via pip):
+# - Tesseract OCR engine (install via: brew install tesseract tesseract-lang)
+# - Marathi language data for Tesseract

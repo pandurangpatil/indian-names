@@ -18,6 +18,7 @@ from collections import deque
 import traceback
 import time
 import config
+import unicodedata
 
 
 # OCR error correction dictionary
@@ -47,6 +48,159 @@ OCR_CORRECTIONS = {
     'बय :': 'वय :',
     'चे नाव:': 'वडिलांचे नाव:',
 }
+
+
+def normalize_devanagari(name: str) -> str:
+    """
+    Normalize Devanagari names for consistent duplicate detection.
+
+    Applies aggressive normalization to handle common variations:
+    - Unicode NFD normalization
+    - Remove anusvara (ं U+0902) and chandrabindu (ँ U+0901)
+    - Remove nukta (़ U+093C) for Urdu/Persian sounds
+    - Normalize vowel matras (short vs long: ि/ी, ु/ू, etc.)
+
+    Args:
+        name: Name string to normalize
+
+    Returns:
+        Normalized name string for comparison
+    """
+    if not name:
+        return ""
+
+    # Apply NFD normalization first
+    normalized = unicodedata.normalize('NFD', name)
+
+    # Remove common diacritical marks that cause variations
+    # Anusvara (ं U+0902) - nasal sound modifier
+    normalized = normalized.replace('\u0902', '')
+    # Chandrabindu (ँ U+0901) - nasalization
+    normalized = normalized.replace('\u0901', '')
+    # Nukta (़ U+093C) - used for Persian/Urdu sounds
+    normalized = normalized.replace('\u093C', '')
+
+    # Normalize vowel length differences (treat short and long vowels as same)
+    vowel_mappings = {
+        '\u093F': '\u0940',  # ि (short i) -> ी (long i)
+        '\u0941': '\u0942',  # ु (short u) -> ू (long u)
+        '\u0947': '\u0948',  # े (short e) -> ै (ai)
+        '\u094B': '\u094C',  # ो (short o) -> ौ (au)
+    }
+
+    for short, long in vowel_mappings.items():
+        normalized = normalized.replace(short, long)
+
+    # Apply NFC to recompose any decomposed characters
+    normalized = unicodedata.normalize('NFC', normalized)
+
+    return normalized
+
+
+class DuplicateTracker:
+    """Track duplicate names found during processing for reporting."""
+
+    def __init__(self):
+        # Maps normalized name -> list of (original_name, line_number) tuples
+        self.duplicates: Dict[str, List[Tuple[str, int]]] = {}
+        self.line_counter = 0
+
+    def add_name(self, name: str) -> bool:
+        """
+        Track a name and check if it's a duplicate.
+
+        Args:
+            name: Original name to track
+
+        Returns:
+            True if this is the first occurrence (not a duplicate), False if duplicate
+        """
+        self.line_counter += 1
+        normalized = normalize_devanagari(name)
+
+        if normalized not in self.duplicates:
+            # First occurrence
+            self.duplicates[normalized] = [(name, self.line_counter)]
+            return True
+        else:
+            # Duplicate found
+            self.duplicates[normalized].append((name, self.line_counter))
+            return False
+
+    def get_duplicate_groups(self) -> List[Dict]:
+        """
+        Get all duplicate groups found.
+
+        Returns:
+            List of dictionaries containing duplicate information
+        """
+        duplicate_groups = []
+
+        for normalized, occurrences in self.duplicates.items():
+            if len(occurrences) > 1:
+                duplicate_groups.append({
+                    'normalized': normalized,
+                    'count': len(occurrences),
+                    'occurrences': occurrences
+                })
+
+        return duplicate_groups
+
+    def get_statistics(self) -> Dict:
+        """Get summary statistics about duplicates."""
+        duplicate_groups = self.get_duplicate_groups()
+        total_duplicates = sum(group['count'] - 1 for group in duplicate_groups)
+
+        return {
+            'total_names_processed': self.line_counter,
+            'unique_names': len(self.duplicates),
+            'duplicate_groups': len(duplicate_groups),
+            'total_duplicates': total_duplicates
+        }
+
+    def save_report(self, output_path: str):
+        """Save duplicate report to file."""
+        duplicate_groups = self.get_duplicate_groups()
+
+        if not duplicate_groups:
+            return
+
+        stats = self.get_statistics()
+
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write("=" * 80 + "\n")
+            f.write("DUPLICATE NAMES REPORT\n")
+            f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("=" * 80 + "\n\n")
+
+            f.write("SUMMARY STATISTICS\n")
+            f.write("-" * 80 + "\n")
+            f.write(f"Total names processed: {stats['total_names_processed']}\n")
+            f.write(f"Unique names (after deduplication): {stats['unique_names']}\n")
+            f.write(f"Duplicate groups found: {stats['duplicate_groups']}\n")
+            f.write(f"Total duplicates removed: {stats['total_duplicates']}\n")
+            f.write(f"Duplicate rate: {stats['total_duplicates']/stats['total_names_processed']*100:.2f}%\n")
+            f.write("\n")
+
+            f.write(f"DUPLICATE GROUPS ({len(duplicate_groups)} groups)\n")
+            f.write("=" * 80 + "\n\n")
+
+            # Sort by count (most duplicates first)
+            duplicate_groups.sort(key=lambda x: x['count'], reverse=True)
+
+            for idx, group in enumerate(duplicate_groups, 1):
+                f.write(f"--- Group #{idx} ---\n")
+                f.write(f"Normalized form: {group['normalized']}\n")
+                f.write(f"Total occurrences: {group['count']}\n")
+                f.write(f"Variations found:\n")
+
+                for original, line_num in group['occurrences']:
+                    f.write(f"  Line {line_num}: {original}\n")
+
+                f.write("\n")
+
+        print(f"  ✓ Duplicate report saved to: {output_path}")
+        print(f"  ✓ Found {stats['duplicate_groups']} duplicate groups, removed {stats['total_duplicates']} duplicates")
 
 
 class ErrorLogger:
@@ -577,7 +731,7 @@ def extract_voters_from_pdf(pdf_path: str, start_page: int, end_page: int, error
     return all_names
 
 
-def process_folder(folder_path: Path, start_page: int, end_page: int, output_file: str) -> None:
+def process_folder(folder_path: Path, start_page: int, end_page: int, output_file: str, output_folder: Path = None) -> None:
     """
     Process all PDF files in a folder and extract voter names.
 
@@ -586,6 +740,7 @@ def process_folder(folder_path: Path, start_page: int, end_page: int, output_fil
         start_page: Starting page number for extraction
         end_page: Ending page number for extraction
         output_file: Output CSV filename
+        output_folder: Optional output folder path (default: None = use folder_path)
     """
     pdf_files = sorted(folder_path.glob("*.pdf"))
 
@@ -593,19 +748,31 @@ def process_folder(folder_path: Path, start_page: int, end_page: int, output_fil
         print(f"✗ No PDF files found in: {folder_path}")
         return
 
+    # Determine output location
+    if output_folder is None:
+        output_folder = folder_path
+    else:
+        output_folder.mkdir(parents=True, exist_ok=True)
+
+    # Update output file path to be in output folder
+    output_file = str(output_folder / Path(output_file).name)
+
     print("=" * 80)
     print(f"Maharashtra Voter Name Extractor - All Names")
     print("=" * 80)
     print(f"Folder: {folder_path}")
+    print(f"Output folder: {output_folder}")
     print(f"Found {len(pdf_files)} PDF file(s)")
     print(f"Extracting pages: {start_page} to {end_page}")
     print(f"Output format: Plain text (one name per line)")
     print(f"Validation: Strict Devanagari only")
+    print(f"Deduplication: Unicode NFD normalization")
     print("=" * 80)
 
-    # Initialize error logger
+    # Initialize error logger and duplicate tracker
     error_file = output_file.replace('.txt', '_errors.txt').replace('.csv', '_errors.txt')
     error_logger = ErrorLogger(error_file)
+    duplicate_tracker = DuplicateTracker()
 
     all_names = []
     successful = 0
@@ -633,12 +800,16 @@ def process_folder(folder_path: Path, start_page: int, end_page: int, output_fil
     # Save error log
     error_logger.save()
 
-    # Combine all results and remove duplicates
+    # Combine all results and remove duplicates using normalization
     if all_names:
         initial_count = len(all_names)
 
-        # Remove duplicates while preserving order
-        unique_names = list(dict.fromkeys(all_names))
+        # Remove duplicates using Unicode normalization
+        unique_names = []
+        for name in all_names:
+            if duplicate_tracker.add_name(name):
+                unique_names.append(name)
+
         duplicates_removed = initial_count - len(unique_names)
 
         # Save to TXT file
@@ -658,6 +829,10 @@ def process_folder(folder_path: Path, start_page: int, end_page: int, output_fil
                 if name:  # Only write non-empty names
                     f.write(name + '\n')
 
+        # Save duplicate report
+        duplicates_file = output_file.replace('.txt', '_duplicates_report.txt')
+        duplicate_tracker.save_report(duplicates_file)
+
         print("\n" + "=" * 80)
         print("EXTRACTION COMPLETE")
         print("=" * 80)
@@ -668,6 +843,7 @@ def process_folder(folder_path: Path, start_page: int, end_page: int, output_fil
         print(f"✓ Unique names: {len(unique_names)}")
         print(f"✓ Output saved to: {output_file}")
         print(f"✓ First names saved to: {only_names_file} ({len(extracted_first_names)} words)")
+        print(f"✓ Duplicates report: {duplicates_file}")
         print("=" * 80)
 
         # Display sample
@@ -773,12 +949,13 @@ def name_writer_process(names_queue: multiprocessing.Queue,
         dedup_window_size: Size of the sliding window for duplicate detection
     """
     try:
-        # Track file handles and deduplication windows for each PDF
+        # Track file handles, deduplication windows, and duplicate trackers for each PDF
         file_handles: Dict[str, Dict[str, any]] = {}
+        error_logs_to_consolidate: Dict[str, List[str]] = {}  # pdf_file -> list of error log paths
         completed_workers = 0
         total_names_written = 0
 
-        print(f"[Name Writer] Started (window size: {dedup_window_size})")
+        print(f"[Name Writer] Started (window size: {dedup_window_size}, normalization: NFD)")
 
         while completed_workers < num_workers:
             try:
@@ -789,6 +966,13 @@ def name_writer_process(names_queue: multiprocessing.Queue,
                         completed_workers += 1
                         print(f"[Name Writer] Worker {error_msg['worker_id']} {error_msg['status']} "
                               f"({completed_workers}/{num_workers})")
+
+                        # Track error log for consolidation
+                        if error_msg.get('status') == 'completed' and error_msg.get('error_log'):
+                            pdf_file = error_msg['pdf_file']
+                            if pdf_file not in error_logs_to_consolidate:
+                                error_logs_to_consolidate[pdf_file] = []
+                            error_logs_to_consolidate[pdf_file].append(error_msg['error_log'])
                 except:
                     pass
 
@@ -811,26 +995,32 @@ def name_writer_process(names_queue: multiprocessing.Queue,
                             'full_window': deque(maxlen=dedup_window_size),
                             'first_window': deque(maxlen=dedup_window_size),
                             'full_count': 0,
-                            'first_count': 0
+                            'first_count': 0,
+                            'full_tracker': DuplicateTracker(),
+                            'first_tracker': DuplicateTracker()
                         }
                         print(f"[Name Writer] Created output files for: {pdf_file}")
 
                     handles = file_handles[pdf_file]
 
-                    # Check for duplicates in the appropriate window
+                    # Check for duplicates using normalization
                     if name_type == 'full':
-                        if name not in handles['full_window']:
+                        normalized = normalize_devanagari(name)
+                        if normalized not in handles['full_window']:
                             handles['full_handle'].write(name + '\n')
                             handles['full_handle'].flush()  # Ensure immediate write
-                            handles['full_window'].append(name)
+                            handles['full_window'].append(normalized)
+                            handles['full_tracker'].add_name(name)
                             handles['full_count'] += 1
                             total_names_written += 1
 
                     elif name_type == 'first':
-                        if name not in handles['first_window']:
+                        normalized = normalize_devanagari(name)
+                        if normalized not in handles['first_window']:
                             handles['first_handle'].write(name + '\n')
                             handles['first_handle'].flush()  # Ensure immediate write
-                            handles['first_window'].append(name)
+                            handles['first_window'].append(normalized)
+                            handles['first_tracker'].add_name(name)
                             handles['first_count'] += 1
 
                 except multiprocessing.queues.Empty:
@@ -853,17 +1043,20 @@ def name_writer_process(names_queue: multiprocessing.Queue,
 
                 if pdf_file in file_handles:
                     handles = file_handles[pdf_file]
+                    normalized = normalize_devanagari(name)
 
-                    if name_type == 'full' and name not in handles['full_window']:
+                    if name_type == 'full' and normalized not in handles['full_window']:
                         handles['full_handle'].write(name + '\n')
-                        handles['full_window'].append(name)
+                        handles['full_window'].append(normalized)
+                        handles['full_tracker'].add_name(name)
                         handles['full_count'] += 1
                         total_names_written += 1
                         remaining_count += 1
 
-                    elif name_type == 'first' and name not in handles['first_window']:
+                    elif name_type == 'first' and normalized not in handles['first_window']:
                         handles['first_handle'].write(name + '\n')
-                        handles['first_window'].append(name)
+                        handles['first_window'].append(normalized)
+                        handles['first_tracker'].add_name(name)
                         handles['first_count'] += 1
                         remaining_count += 1
 
@@ -873,7 +1066,32 @@ def name_writer_process(names_queue: multiprocessing.Queue,
         if remaining_count > 0:
             print(f"[Name Writer] Processed {remaining_count} remaining names")
 
-        # Close all file handles and print summary
+        # Consolidate error logs and generate reports
+        print("\n[Name Writer] Consolidating error logs and generating reports...")
+        for pdf_file, error_log_paths in error_logs_to_consolidate.items():
+            if error_log_paths:
+                consolidated_error_file = str(output_dir / f"{pdf_file}_errors.txt")
+
+                # Read and consolidate all error logs
+                with open(consolidated_error_file, 'w', encoding='utf-8') as out_f:
+                    for error_log_path in error_log_paths:
+                        try:
+                            with open(error_log_path, 'r', encoding='utf-8') as in_f:
+                                out_f.write(in_f.read())
+                                out_f.write("\n" + "=" * 80 + "\n")
+                        except Exception as e:
+                            print(f"[Name Writer] Warning: Could not read error log {error_log_path}: {e}")
+
+                print(f"  ✓ Consolidated error log: {consolidated_error_file}")
+
+                # Clean up temporary error logs
+                for error_log_path in error_log_paths:
+                    try:
+                        Path(error_log_path).unlink()
+                    except:
+                        pass
+
+        # Close all file handles, generate duplicate reports, and print summary
         print("\n" + "=" * 80)
         print("NAME WRITER SUMMARY")
         print("=" * 80)
@@ -881,8 +1099,17 @@ def name_writer_process(names_queue: multiprocessing.Queue,
             print(f"\n{pdf_file}:")
             print(f"  Full names: {handles['full_count']}")
             print(f"  First names: {handles['first_count']}")
+
+            # Close file handles
             handles['full_handle'].close()
             handles['first_handle'].close()
+
+            # Generate duplicate reports
+            full_dup_report = str(output_dir / f"{pdf_file}_extracted_names_duplicates_report.txt")
+            first_dup_report = str(output_dir / f"{pdf_file}_only_names_duplicates_report.txt")
+
+            handles['full_tracker'].save_report(full_dup_report)
+            handles['first_tracker'].save_report(first_dup_report)
 
         print(f"\nTotal names written: {total_names_written}")
         print("=" * 80)
@@ -901,7 +1128,8 @@ def name_writer_process(names_queue: multiprocessing.Queue,
 
 
 def process_folder_parallel(folder_path: Path, start_page: int, end_page: int,
-                           num_workers: int = None, dedup_window_size: int = None):
+                           num_workers: int = None, dedup_window_size: int = None,
+                           output_folder: Path = None):
     """
     Process all PDF files in a folder using parallel workers.
 
@@ -911,6 +1139,7 @@ def process_folder_parallel(folder_path: Path, start_page: int, end_page: int,
         end_page: Ending page number (1-indexed)
         num_workers: Number of worker processes (default: CPU count - 1)
         dedup_window_size: Size of deduplication window (default: from config)
+        output_folder: Optional output folder path (default: None = use folder_path)
     """
     if num_workers is None:
         num_workers = config.NUM_WORKERS
@@ -918,12 +1147,20 @@ def process_folder_parallel(folder_path: Path, start_page: int, end_page: int,
     if dedup_window_size is None:
         dedup_window_size = config.DEDUP_WINDOW_SIZE
 
+    # Determine output location
+    if output_folder is None:
+        output_folder = folder_path
+    else:
+        output_folder.mkdir(parents=True, exist_ok=True)
+
     print("\n" + "=" * 80)
     print("PARALLEL PROCESSING MODE")
     print("=" * 80)
     print(f"Worker processes: {num_workers}")
     print(f"Deduplication window: {dedup_window_size} names")
+    print(f"Deduplication method: Unicode NFD normalization")
     print(f"Input folder: {folder_path}")
+    print(f"Output folder: {output_folder}")
     print("=" * 80 + "\n")
 
     # Find all PDF files
@@ -939,10 +1176,10 @@ def process_folder_parallel(folder_path: Path, start_page: int, end_page: int,
     names_queue = multiprocessing.Queue(maxsize=config.QUEUE_MAX_SIZE)
     error_queue = multiprocessing.Queue()
 
-    # Start the name writer process
+    # Start the name writer process (use output_folder, not folder_path)
     writer_process = multiprocessing.Process(
         target=name_writer_process,
-        args=(names_queue, error_queue, folder_path, len(pdf_files), dedup_window_size)
+        args=(names_queue, error_queue, output_folder, len(pdf_files), dedup_window_size)
     )
     writer_process.start()
 
@@ -997,9 +1234,13 @@ def process_folder_parallel(folder_path: Path, start_page: int, end_page: int,
         writer_process.join()
 
     print("\n✓ Parallel processing completed!")
-    print(f"\nOutput files created in: {folder_path}")
-    print("File naming format: <pdf_basename>_extracted_names.txt")
-    print("                    <pdf_basename>_only_names.txt")
+    print(f"\nOutput files created in: {output_folder}")
+    print("File naming format:")
+    print("  <pdf_basename>_extracted_names.txt")
+    print("  <pdf_basename>_only_names.txt")
+    print("  <pdf_basename>_errors.txt")
+    print("  <pdf_basename>_extracted_names_duplicates_report.txt")
+    print("  <pdf_basename>_only_names_duplicates_report.txt")
 
 
 def main():
@@ -1031,7 +1272,14 @@ Examples:
         '-o', '--output',
         type=str,
         default=None,
-        help='Output TXT filename (default: extracted_names_<timestamp>.txt). Creates both extracted_names and only_names files.'
+        help='Output TXT filename (default: extracted_names_<timestamp>.txt). Creates both extracted_names and only_names files. Only used in sequential mode.'
+    )
+
+    parser.add_argument(
+        '--output-folder',
+        type=str,
+        default=None,
+        help='Output folder for all generated files (default: ./output in current directory). If not specified, files are saved in the input folder.'
     )
 
     parser.add_argument(
@@ -1097,6 +1345,13 @@ Examples:
         print(f"✗ Error: Path is not a directory: {folder_path}")
         sys.exit(1)
 
+    # Determine output folder
+    if args.output_folder:
+        output_folder_path = Path(args.output_folder).resolve()
+    else:
+        # Default to ./output in current directory
+        output_folder_path = Path.cwd() / 'output'
+
     # Determine processing mode
     use_parallel = args.parallel and not args.no_parallel
 
@@ -1116,14 +1371,14 @@ Examples:
             print("✗ Error: Deduplication window size must be at least 1")
             sys.exit(1)
 
-        process_folder_parallel(folder_path, start_page, end_page, num_workers, dedup_window)
+        process_folder_parallel(folder_path, start_page, end_page, num_workers, dedup_window, output_folder_path)
     else:
         # Use sequential processing (original behavior)
         print("\n" + "=" * 80)
         print("SEQUENTIAL PROCESSING MODE")
         print("=" * 80 + "\n")
 
-        process_folder(folder_path, start_page, end_page, output_file)
+        process_folder(folder_path, start_page, end_page, output_file, output_folder_path)
 
 
 if __name__ == "__main__":

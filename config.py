@@ -30,7 +30,7 @@ WORKER_SENTINEL = None
 PROGRESS_UPDATE_INTERVAL = 10  # Update progress every N names
 
 # Output File Configuration
-OUTPUT_DIR = None  # If None, output to same directory as input folder
+DEFAULT_OUTPUT_FOLDER = './output'  # Default output folder in current directory
 TIMESTAMP_FORMAT = "%Y%m%d_%H%M%S"
 
 # Error Handling

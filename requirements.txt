@@ -2,9 +2,15 @@
 # Python 3.8+ required
 
 # Core dependencies
-pdfplumber==0.11.4      # PDF text extraction with spatial awareness
+pdfplumber==0.11.8      # PDF text extraction with spatial awareness
 pytesseract==0.3.13     # Python wrapper for Tesseract OCR
-Pillow==11.0.0          # Image processing for OCR
+Pillow==12.0.0          # Image processing for OCR
+
+# Built-in Python modules used (no installation required):
+# - unicodedata: For Devanagari text normalization and duplicate detection
+# - multiprocessing: For parallel PDF processing
+# - pathlib: For cross-platform file path handling
+# - argparse: For command-line argument parsing
 
 # System requirements (not installed via pip):
 # - Tesseract OCR engine (install via: brew install tesseract tesseract-lang)

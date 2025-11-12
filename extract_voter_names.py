@@ -105,6 +105,38 @@ class ErrorLogger:
             print(f"  ⚠ Logged {total} issues to: {self.output_path}")
 
 
+def extract_first_name(full_name: str) -> list:
+    """
+    Extract first name(s) from a full name based on word count rules.
+    Returns a list of individual words to be written on separate lines.
+
+    Rules:
+    - 1 word: return [word] (1 line)
+    - 2 words: return [first_word] (1 line)
+    - 3 words: return [first_word, second_word] (2 lines)
+    - 4+ words: return [first_word] (1 line)
+
+    Args:
+        full_name: The full name string
+
+    Returns:
+        List of extracted name words (each word will be on a separate line)
+    """
+    words = full_name.strip().split()
+    word_count = len(words)
+
+    if word_count == 0:
+        return []
+    elif word_count == 1:
+        return [words[0]]
+    elif word_count == 2:
+        return [words[0]]
+    elif word_count == 3:
+        return [words[0], words[1]]
+    else:  # 4 or more words
+        return [words[0]]
+
+
 def apply_ocr_corrections(text: str) -> str:
     """Apply OCR error corrections to text."""
     corrected = text
@@ -127,18 +159,69 @@ def is_label_only(text: str) -> bool:
     return False
 
 
+def clean_name(name: str) -> str:
+    """
+    Clean a name by removing label words, special characters, and other artifacts.
+
+    Args:
+        name: Raw name string potentially containing labels and special characters
+
+    Returns:
+        Cleaned name string
+    """
+    if not name:
+        return ""
+
+    # Remove prefix labels (at start of name)
+    name = re.sub(r'^नावः\s*', '', name)
+    name = re.sub(r"^नाव[',]?\s*", '', name)
+
+    # Remove suffix labels (at end of name)
+    # Order matters - check longer patterns first
+    name = re.sub(r'\s+वडिलांचें$', '', name)
+    name = re.sub(r'\s+वडिलांचे$', '', name)
+    name = re.sub(r'\s+वडिलां$', '', name)
+    name = re.sub(r'\s+डेलांचे$', '', name)
+    name = re.sub(r'\s+पती$', '', name)
+    name = re.sub(r'\s+नाव$', '', name)
+    name = re.sub(r'\s+आई$', '', name)
+
+    # Handle "उर्फ" (alias) patterns
+    # If उर्फ appears in the middle, keep the part before it (primary name)
+    if ' उर्फ ' in name:
+        name = name.split(' उर्फ ')[0]
+    # If उर्फ is at the start, remove it
+    name = re.sub(r'^उर्फ\s+', '', name)
+
+    # Remove possessive "च्या" constructions
+    # Pattern: <name>च्या <surname> → keep only <surname>
+    name = re.sub(r'[^\s]+च्या\s+', '', name)
+
+    # Remove special characters
+    name = re.sub(r'[ः]', '', name)  # Visarga
+    name = re.sub(r"[',]", '', name)  # Apostrophe and comma
+
+    # Clean up multiple spaces
+    name = re.sub(r'\s+', ' ', name).strip()
+
+    return name
+
+
 def is_valid_devanagari_name(name: str) -> Tuple[bool, str]:
     """
     Strictly validate if text is a valid Devanagari name.
+    Cleans the name first, then validates.
 
     Returns:
         Tuple of (is_valid, rejection_reason)
     """
+    # Clean the name first
+    name = clean_name(name)
     name = name.strip()
 
-    # Check minimum length
+    # Check minimum length after cleaning
     if len(name) < 3:
-        return False, "Too short (less than 3 characters)"
+        return False, "Too short after cleaning (less than 3 characters)"
 
     # Check if it's only a label
     if is_label_only(name):
@@ -154,8 +237,8 @@ def is_valid_devanagari_name(name: str) -> Tuple[bool, str]:
 
     # Check for special characters (allow only Devanagari and basic punctuation)
     # Devanagari range: U+0900–U+097F
-    # Allow: space, apostrophe ('), hyphen (-), comma (,)
-    allowed_pattern = r'^[\u0900-\u097F\s\'\-,]+$'
+    # Allow: space, hyphen (-), nukta (़) which is legitimate in Urdu-origin names
+    allowed_pattern = r'^[\u0900-\u097F\s\-]+$'
     if not re.match(allowed_pattern, name):
         return False, "Contains invalid special characters"
 
@@ -172,7 +255,7 @@ def is_valid_devanagari_name(name: str) -> Tuple[bool, str]:
         return False, "Insufficient Devanagari characters"
 
     # Check for excessive punctuation
-    punctuation_count = len(re.findall(r'[\'\-,;:|]', name))
+    punctuation_count = len(re.findall(r'[\-;:|]', name))
     char_count = len(name.replace(' ', ''))
     if char_count > 0 and punctuation_count / char_count > 0.3:
         return False, "Excessive punctuation"
@@ -287,20 +370,23 @@ def extract_voter_from_text_block(text: str, pdf_file: str, page_num: int, error
                                 break
 
                     if name:
-                        # Clean up the name
+                        # Basic cleanup before validation
                         name = re.sub(r'^\s*(नाव|नाब|पतीचे|वडिलांचे|पत्नीचे|आईचे)\s*[:;]\s*', '', name)
                         name = re.sub(r'\s+', ' ', name).strip()
                         # Remove OCR artifacts
                         name = re.sub(r'\s*(att|Fart|Fert)\s*', ' ', name).strip()
                         name = re.sub(r'\s+', ' ', name).strip()
-                        # Remove prefixes like 'ः' or other punctuation
+                        # Remove prefixes like ':' or other punctuation
                         name = re.sub(r'^[:\s;]+', '', name).strip()
 
-                        # Validate the name
+                        # Validate the name (validation will clean it further)
                         is_valid, rejection_reason = is_valid_devanagari_name(name)
 
                         if is_valid:
-                            all_names.append(name)
+                            # Get the cleaned version
+                            cleaned_name = clean_name(name)
+                            if cleaned_name:  # Only add if not empty after cleaning
+                                all_names.append(cleaned_name)
                         elif name and len(name) >= 3:  # Only log if it's substantial enough
                             error_logger.log_rejected_name(pdf_file, page_num, name, rejection_reason)
 
@@ -553,6 +639,18 @@ def process_folder(folder_path: Path, start_page: int, end_page: int, output_fil
             for name in unique_names:
                 f.write(name + '\n')
 
+        # Extract and save only first names (flatten list of lists)
+        only_names_file = output_file.replace('extracted_names_', 'only_names_')
+        extracted_first_names = []
+        for name in unique_names:
+            name_words = extract_first_name(name)
+            extracted_first_names.extend(name_words)
+
+        with open(only_names_file, 'w', encoding='utf-8') as f:
+            for name in extracted_first_names:
+                if name:  # Only write non-empty names
+                    f.write(name + '\n')
+
         print("\n" + "=" * 80)
         print("EXTRACTION COMPLETE")
         print("=" * 80)
@@ -562,6 +660,7 @@ def process_folder(folder_path: Path, start_page: int, end_page: int, output_fil
         print(f"✓ Duplicates removed: {duplicates_removed}")
         print(f"✓ Unique names: {len(unique_names)}")
         print(f"✓ Output saved to: {output_file}")
+        print(f"✓ First names saved to: {only_names_file} ({len(extracted_first_names)} words)")
         print("=" * 80)
 
         # Display sample
@@ -599,7 +698,7 @@ Examples:
         '-o', '--output',
         type=str,
         default=None,
-        help='Output TXT filename (default: extracted_names_<timestamp>.txt)'
+        help='Output TXT filename (default: extracted_names_<timestamp>.txt). Creates both extracted_names and only_names files.'
     )
 
     parser.add_argument(

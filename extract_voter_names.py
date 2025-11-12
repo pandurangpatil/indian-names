@@ -9,10 +9,15 @@ import re
 import argparse
 import pdfplumber
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Optional
 import pytesseract
 import sys
 from datetime import datetime
+import multiprocessing
+from collections import deque
+import traceback
+import time
+import config
 
 
 # OCR error correction dictionary
@@ -539,7 +544,7 @@ def extract_voters_from_page(page, page_num: int, pdf_file: str, error_logger: E
     return names
 
 
-def extract_voters_from_pdf(pdf_path: str, start_page: int, end_page: int, error_logger: ErrorLogger) -> List[str]:
+def extract_voters_from_pdf(pdf_path: str, start_page: int, end_page: int, error_logger: ErrorLogger, worker_id: int = None) -> List[str]:
     """
     Extract voter names from PDF file using spatial parsing.
 
@@ -548,6 +553,7 @@ def extract_voters_from_pdf(pdf_path: str, start_page: int, end_page: int, error
         start_page: Starting page number (1-indexed)
         end_page: Ending page number (1-indexed, inclusive)
         error_logger: Error logger instance
+        worker_id: Optional worker ID for parallel processing progress messages
 
     Returns:
         List of extracted names
@@ -560,7 +566,8 @@ def extract_voters_from_pdf(pdf_path: str, start_page: int, end_page: int, error
         actual_end = min(end_page, total_pages)
 
         for page_num in range(start_page - 1, actual_end):
-            print(f"    Page {page_num + 1}/{actual_end}...", end=" ")
+            worker_prefix = f"[Worker {worker_id}] " if worker_id is not None else ""
+            print(f"{worker_prefix}    Page {page_num + 1}/{actual_end}...", end=" ")
             page = pdf.pages[page_num]
 
             names = extract_voters_from_page(page, page_num + 1, pdf_file, error_logger)
@@ -607,7 +614,7 @@ def process_folder(folder_path: Path, start_page: int, end_page: int, output_fil
     for idx, pdf_file in enumerate(pdf_files, 1):
         print(f"\n[{idx}/{len(pdf_files)}] Processing: {pdf_file.name}")
         try:
-            names = extract_voters_from_pdf(str(pdf_file), start_page, end_page, error_logger)
+            names = extract_voters_from_pdf(str(pdf_file), start_page, end_page, error_logger, None)
 
             if names:
                 all_names.extend(names)
@@ -674,6 +681,327 @@ def process_folder(folder_path: Path, start_page: int, end_page: int, output_fil
         print("\n✗ No names were extracted from any PDF files.")
 
 
+def file_worker_process(pdf_path: str, start_page: int, end_page: int,
+                       names_queue: multiprocessing.Queue,
+                       error_queue: multiprocessing.Queue,
+                       worker_id: int):
+    """
+    Worker process that extracts names from a single PDF file.
+
+    Args:
+        pdf_path: Path to the PDF file to process
+        start_page: Starting page number (1-indexed)
+        end_page: Ending page number (1-indexed)
+        names_queue: Queue to push extracted names
+        error_queue: Queue to push error messages
+        worker_id: Unique identifier for this worker
+    """
+    try:
+        pdf_file = Path(pdf_path)
+        pdf_basename = pdf_file.stem
+
+        # Create a temporary error logger for this worker
+        temp_error_log = f"/tmp/{pdf_basename}_errors_worker_{worker_id}.txt"
+        error_logger = ErrorLogger(temp_error_log)
+
+        print(f"[Worker {worker_id}] Processing: {pdf_file.name}")
+
+        # Extract names from the PDF
+        names = extract_voters_from_pdf(str(pdf_path), start_page, end_page, error_logger, worker_id)
+
+        # Push each name to the queue with metadata
+        for name in names:
+            # Extract first name(s) - returns a list
+            first_names = extract_first_name(name)
+
+            # Push full name
+            names_queue.put({
+                'pdf_file': pdf_basename,
+                'name': name,
+                'type': 'full',
+                'worker_id': worker_id
+            })
+
+            # Push first name(s) if they exist
+            if first_names:
+                for first_name in first_names:
+                    names_queue.put({
+                        'pdf_file': pdf_basename,
+                        'name': first_name,
+                        'type': 'first',
+                        'worker_id': worker_id
+                    })
+
+        # Save worker-specific error log
+        error_logger.save()
+
+        # Send completion message
+        error_queue.put({
+            'pdf_file': pdf_basename,
+            'worker_id': worker_id,
+            'status': 'completed',
+            'names_count': len(names),
+            'error_log': temp_error_log
+        })
+
+        print(f"[Worker {worker_id}] Completed: {pdf_file.name} ({len(names)} names)")
+
+    except Exception as e:
+        error_msg = f"Error processing {pdf_path}: {str(e)}\n{traceback.format_exc()}"
+        error_queue.put({
+            'pdf_file': Path(pdf_path).stem,
+            'worker_id': worker_id,
+            'status': 'failed',
+            'error': error_msg
+        })
+        print(f"[Worker {worker_id}] Failed: {Path(pdf_path).name} - {str(e)}")
+
+
+def name_writer_process(names_queue: multiprocessing.Queue,
+                       error_queue: multiprocessing.Queue,
+                       output_dir: Path,
+                       num_workers: int,
+                       dedup_window_size: int):
+    """
+    Dedicated process for writing names to files with deduplication.
+
+    Args:
+        names_queue: Queue from which to read extracted names
+        error_queue: Queue to monitor worker completion
+        output_dir: Directory where output files will be written
+        num_workers: Total number of file worker processes
+        dedup_window_size: Size of the sliding window for duplicate detection
+    """
+    try:
+        # Track file handles and deduplication windows for each PDF
+        file_handles: Dict[str, Dict[str, any]] = {}
+        completed_workers = 0
+        total_names_written = 0
+
+        print(f"[Name Writer] Started (window size: {dedup_window_size})")
+
+        while completed_workers < num_workers:
+            try:
+                # Check for completion messages
+                try:
+                    error_msg = error_queue.get_nowait()
+                    if error_msg.get('status') in ['completed', 'failed']:
+                        completed_workers += 1
+                        print(f"[Name Writer] Worker {error_msg['worker_id']} {error_msg['status']} "
+                              f"({completed_workers}/{num_workers})")
+                except:
+                    pass
+
+                # Process names from queue
+                try:
+                    name_data = names_queue.get(timeout=config.QUEUE_TIMEOUT)
+
+                    pdf_file = name_data['pdf_file']
+                    name = name_data['name']
+                    name_type = name_data['type']
+
+                    # Initialize file handles and dedup window for this PDF if not exists
+                    if pdf_file not in file_handles:
+                        full_names_file = str(output_dir / f"{pdf_file}_extracted_names.txt")
+                        first_names_file = str(output_dir / f"{pdf_file}_only_names.txt")
+
+                        file_handles[pdf_file] = {
+                            'full_handle': open(full_names_file, 'w', encoding='utf-8'),
+                            'first_handle': open(first_names_file, 'w', encoding='utf-8'),
+                            'full_window': deque(maxlen=dedup_window_size),
+                            'first_window': deque(maxlen=dedup_window_size),
+                            'full_count': 0,
+                            'first_count': 0
+                        }
+                        print(f"[Name Writer] Created output files for: {pdf_file}")
+
+                    handles = file_handles[pdf_file]
+
+                    # Check for duplicates in the appropriate window
+                    if name_type == 'full':
+                        if name not in handles['full_window']:
+                            handles['full_handle'].write(name + '\n')
+                            handles['full_handle'].flush()  # Ensure immediate write
+                            handles['full_window'].append(name)
+                            handles['full_count'] += 1
+                            total_names_written += 1
+
+                    elif name_type == 'first':
+                        if name not in handles['first_window']:
+                            handles['first_handle'].write(name + '\n')
+                            handles['first_handle'].flush()  # Ensure immediate write
+                            handles['first_window'].append(name)
+                            handles['first_count'] += 1
+
+                except multiprocessing.queues.Empty:
+                    # Queue is empty, continue checking for completion
+                    continue
+
+            except KeyboardInterrupt:
+                print("[Name Writer] Interrupted by user")
+                break
+
+        # Process any remaining names in the queue
+        print("[Name Writer] Processing remaining names...")
+        remaining_count = 0
+        while True:
+            try:
+                name_data = names_queue.get_nowait()
+                pdf_file = name_data['pdf_file']
+                name = name_data['name']
+                name_type = name_data['type']
+
+                if pdf_file in file_handles:
+                    handles = file_handles[pdf_file]
+
+                    if name_type == 'full' and name not in handles['full_window']:
+                        handles['full_handle'].write(name + '\n')
+                        handles['full_window'].append(name)
+                        handles['full_count'] += 1
+                        total_names_written += 1
+                        remaining_count += 1
+
+                    elif name_type == 'first' and name not in handles['first_window']:
+                        handles['first_handle'].write(name + '\n')
+                        handles['first_window'].append(name)
+                        handles['first_count'] += 1
+                        remaining_count += 1
+
+            except:
+                break
+
+        if remaining_count > 0:
+            print(f"[Name Writer] Processed {remaining_count} remaining names")
+
+        # Close all file handles and print summary
+        print("\n" + "=" * 80)
+        print("NAME WRITER SUMMARY")
+        print("=" * 80)
+        for pdf_file, handles in file_handles.items():
+            print(f"\n{pdf_file}:")
+            print(f"  Full names: {handles['full_count']}")
+            print(f"  First names: {handles['first_count']}")
+            handles['full_handle'].close()
+            handles['first_handle'].close()
+
+        print(f"\nTotal names written: {total_names_written}")
+        print("=" * 80)
+
+    except Exception as e:
+        print(f"[Name Writer] Fatal error: {str(e)}")
+        print(traceback.format_exc())
+    finally:
+        # Ensure all handles are closed
+        for handles in file_handles.values():
+            try:
+                handles['full_handle'].close()
+                handles['first_handle'].close()
+            except:
+                pass
+
+
+def process_folder_parallel(folder_path: Path, start_page: int, end_page: int,
+                           num_workers: int = None, dedup_window_size: int = None):
+    """
+    Process all PDF files in a folder using parallel workers.
+
+    Args:
+        folder_path: Path to folder containing PDF files
+        start_page: Starting page number (1-indexed)
+        end_page: Ending page number (1-indexed)
+        num_workers: Number of worker processes (default: CPU count - 1)
+        dedup_window_size: Size of deduplication window (default: from config)
+    """
+    if num_workers is None:
+        num_workers = config.NUM_WORKERS
+
+    if dedup_window_size is None:
+        dedup_window_size = config.DEDUP_WINDOW_SIZE
+
+    print("\n" + "=" * 80)
+    print("PARALLEL PROCESSING MODE")
+    print("=" * 80)
+    print(f"Worker processes: {num_workers}")
+    print(f"Deduplication window: {dedup_window_size} names")
+    print(f"Input folder: {folder_path}")
+    print("=" * 80 + "\n")
+
+    # Find all PDF files
+    pdf_files = sorted(folder_path.glob("*.pdf"))
+
+    if not pdf_files:
+        print(f"✗ No PDF files found in: {folder_path}")
+        return
+
+    print(f"Found {len(pdf_files)} PDF file(s) to process\n")
+
+    # Create multiprocessing queues
+    names_queue = multiprocessing.Queue(maxsize=config.QUEUE_MAX_SIZE)
+    error_queue = multiprocessing.Queue()
+
+    # Start the name writer process
+    writer_process = multiprocessing.Process(
+        target=name_writer_process,
+        args=(names_queue, error_queue, folder_path, len(pdf_files), dedup_window_size)
+    )
+    writer_process.start()
+
+    # Create and start worker processes with proper concurrent execution
+    pdf_queue = list(enumerate(pdf_files, 1))  # Queue of (worker_id, pdf_file) tuples
+    active_workers = []
+
+    print(f"[Main] Starting up to {num_workers} concurrent workers...\n")
+
+    # Start initial batch of workers
+    while pdf_queue and len(active_workers) < num_workers:
+        worker_id, pdf_file = pdf_queue.pop(0)
+        worker = multiprocessing.Process(
+            target=file_worker_process,
+            args=(str(pdf_file), start_page, end_page, names_queue, error_queue, worker_id)
+        )
+        worker.start()
+        active_workers.append(worker)
+        print(f"[Main] Started worker {worker_id} for {pdf_file.name}")
+
+    # As workers finish, start new ones
+    while pdf_queue or active_workers:
+        # Remove finished workers
+        for worker in active_workers[:]:  # Copy list to avoid modification issues
+            if not worker.is_alive():
+                worker.join()
+                active_workers.remove(worker)
+
+        # Start new workers if we have capacity and pending files
+        while pdf_queue and len(active_workers) < num_workers:
+            worker_id, pdf_file = pdf_queue.pop(0)
+            worker = multiprocessing.Process(
+                target=file_worker_process,
+                args=(str(pdf_file), start_page, end_page, names_queue, error_queue, worker_id)
+            )
+            worker.start()
+            active_workers.append(worker)
+            print(f"[Main] Started worker {worker_id} for {pdf_file.name}")
+
+        # Small sleep to prevent busy-waiting
+        if active_workers:
+            time.sleep(0.1)
+
+    # All workers have completed
+    print("\n[Main] All workers completed. Waiting for name writer to finish...")
+
+    # Wait for name writer to complete
+    writer_process.join(timeout=30)
+    if writer_process.is_alive():
+        print("[Main] Name writer taking too long, terminating...")
+        writer_process.terminate()
+        writer_process.join()
+
+    print("\n✓ Parallel processing completed!")
+    print(f"\nOutput files created in: {folder_path}")
+    print("File naming format: <pdf_basename>_extracted_names.txt")
+    print("                    <pdf_basename>_only_names.txt")
+
+
 def main():
     """Main function with CLI argument parsing."""
     parser = argparse.ArgumentParser(
@@ -681,9 +1009,14 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # Parallel processing (default, per-file output)
   %(prog)s --folder /path/to/pdfs
-  %(prog)s -f . --output names.csv
-  %(prog)s -f ./pdfs --pages 3-32 --output all_names.csv
+  %(prog)s -f ./pdfs --pages 3-32
+  %(prog)s -f ./pdfs --workers 4 --dedup-window 500
+
+  # Sequential processing (original behavior, single output file)
+  %(prog)s -f ./pdfs --no-parallel --output names.txt
+  %(prog)s -f . --no-parallel --output names.txt --pages 3-32
         """
     )
 
@@ -706,6 +1039,34 @@ Examples:
         type=str,
         default='3-32',
         help='Page range to extract (default: 3-32). Format: START-END'
+    )
+
+    parser.add_argument(
+        '--parallel',
+        action='store_true',
+        default=True,
+        help='Use parallel processing (default: enabled)'
+    )
+
+    parser.add_argument(
+        '--no-parallel',
+        action='store_true',
+        default=False,
+        help='Disable parallel processing (use sequential mode)'
+    )
+
+    parser.add_argument(
+        '-w', '--workers',
+        type=int,
+        default=None,
+        help=f'Number of worker processes (default: CPU count - 1 = {config.NUM_WORKERS})'
+    )
+
+    parser.add_argument(
+        '--dedup-window',
+        type=int,
+        default=None,
+        help=f'Deduplication window size (default: {config.DEDUP_WINDOW_SIZE})'
     )
 
     args = parser.parse_args()
@@ -736,8 +1097,33 @@ Examples:
         print(f"✗ Error: Path is not a directory: {folder_path}")
         sys.exit(1)
 
+    # Determine processing mode
+    use_parallel = args.parallel and not args.no_parallel
+
     # Process folder
-    process_folder(folder_path, start_page, end_page, output_file)
+    if use_parallel:
+        # Use parallel processing
+        num_workers = args.workers if args.workers else config.NUM_WORKERS
+        dedup_window = args.dedup_window if args.dedup_window else config.DEDUP_WINDOW_SIZE
+
+        # Validate workers count
+        if num_workers < 1:
+            print("✗ Error: Number of workers must be at least 1")
+            sys.exit(1)
+
+        # Validate dedup window
+        if dedup_window < 1:
+            print("✗ Error: Deduplication window size must be at least 1")
+            sys.exit(1)
+
+        process_folder_parallel(folder_path, start_page, end_page, num_workers, dedup_window)
+    else:
+        # Use sequential processing (original behavior)
+        print("\n" + "=" * 80)
+        print("SEQUENTIAL PROCESSING MODE")
+        print("=" * 80 + "\n")
+
+        process_folder(folder_path, start_page, end_page, output_file)
 
 
 if __name__ == "__main__":

@@ -538,6 +538,42 @@ def build_phonetic_clusters(names_list: List[str], max_distance: int = 1) -> Dic
     return variant_clusters
 
 
+def apply_correction_if_needed(name: str, correction_type: str) -> str:
+    """
+    Apply corrections to a name based on the specified correction type.
+
+    Args:
+        name: Original name in Devanagari
+        correction_type: 'phonetic_dict', 'pattern', 'both', or None
+
+    Returns:
+        Corrected name (or original if no correction applies)
+    """
+    if correction_type is None:
+        return name
+
+    # Detect what corrections are available for this name
+    pattern_flags, suggested = detect_ocr_pattern_errors(name)
+
+    if not pattern_flags:
+        return name  # No correction available
+
+    # Apply based on correction type
+    if correction_type == 'phonetic_dict':
+        # Only apply if correction is from phonetic dictionary
+        if 'phonetic_dict' in pattern_flags:
+            return suggested
+    elif correction_type == 'pattern':
+        # Only apply if correction is pattern-based (not phonetic_dict)
+        if any(flag != 'phonetic_dict' for flag in pattern_flags):
+            return suggested
+    elif correction_type == 'both':
+        # Apply any correction
+        return suggested
+
+    return name  # No matching correction type
+
+
 def validate_devanagari_morphology(name: str) -> Tuple[bool, List[str]]:
     """
     Validate if a Devanagari name follows typical morphological patterns.
@@ -1143,7 +1179,8 @@ def name_writer_process(names_queue: multiprocessing.Queue,
                        error_queue: multiprocessing.Queue,
                        output_dir: Path,
                        num_workers: int,
-                       dedup_window_size: int):
+                       dedup_window_size: int,
+                       apply_corrections: str = None):
     """
     Dedicated process for writing names to files with deduplication.
 
@@ -1348,16 +1385,31 @@ def name_writer_process(names_queue: multiprocessing.Queue,
         print("=" * 80)
 
         # Use the collected names from memory
-        all_names = global_first_names_list
-        print(f"[Validation] Analyzing {len(all_names)} unique names...")
+        all_names_original = global_first_names_list
+        print(f"[Validation] Analyzing {len(all_names_original)} unique names...")
+
+        # Step 0: Apply corrections if requested
+        if apply_corrections:
+            print(f"[Validation] Applying corrections (type: {apply_corrections})...")
+            all_names_corrected = []
+            corrections_applied = 0
+            for name in all_names_original:
+                corrected = apply_correction_if_needed(name, apply_corrections)
+                all_names_corrected.append(corrected)
+                if corrected != name:
+                    corrections_applied += 1
+            print(f"  ✓ Applied {corrections_applied} corrections")
+            all_names = all_names_corrected
+        else:
+            all_names = all_names_original
 
         # Step 1: Build phonetic clusters (edit distance ≤ 1, grouped by length)
-        print("[Post-Processing] Building phonetic clusters (grouped by length, distance ≤ 1)...")
+        print("[Validation] Building phonetic clusters (grouped by length, distance ≤ 1)...")
         phonetic_clusters = build_phonetic_clusters(all_names, max_distance=1)
         print(f"  ✓ Found {len(phonetic_clusters)} phonetic variant clusters")
 
         # Step 2: Validate Devanagari morphology for all names
-        print("[Post-Processing] Validating Devanagari morphology...")
+        print("[Validation] Validating Devanagari morphology...")
         morphologically_invalid = []
         for name in all_names:
             is_valid, error_reasons = validate_devanagari_morphology(name)
@@ -1365,10 +1417,12 @@ def name_writer_process(names_queue: multiprocessing.Queue,
                 morphologically_invalid.append((name, error_reasons))
         print(f"  ✓ Found {len(morphologically_invalid)} morphologically invalid names")
 
-        # Step 3: Detect OCR pattern errors
+        # Step 3: Detect OCR pattern errors (only for reporting, corrections already applied)
         print("[Validation] Detecting OCR pattern errors...")
         pattern_errors = []
-        for name in all_names:
+        # If corrections were applied, check original names for reporting
+        names_to_check = all_names_original if apply_corrections else all_names
+        for name in names_to_check:
             pattern_flags, suggested = detect_ocr_pattern_errors(name)
             if pattern_flags:
                 pattern_errors.append((name, pattern_flags, suggested))
@@ -1536,7 +1590,7 @@ def name_writer_process(names_queue: multiprocessing.Queue,
 
 def process_folder_parallel(folder_path: Path, start_page: int, end_page: int,
                            num_workers: int = None, dedup_window_size: int = None,
-                           output_folder: Path = None):
+                           output_folder: Path = None, apply_corrections: str = None):
     """
     Process all PDF files in a folder using parallel workers.
 
@@ -1586,7 +1640,7 @@ def process_folder_parallel(folder_path: Path, start_page: int, end_page: int,
     # Start the name writer process (use output_folder, not folder_path)
     writer_process = multiprocessing.Process(
         target=name_writer_process,
-        args=(names_queue, error_queue, output_folder, len(pdf_files), dedup_window_size)
+        args=(names_queue, error_queue, output_folder, len(pdf_files), dedup_window_size, apply_corrections)
     )
     writer_process.start()
 
@@ -1702,6 +1756,14 @@ Examples:
         help=f'Deduplication window size (default: {config.DEDUP_WINDOW_SIZE})'
     )
 
+    parser.add_argument(
+        '-a', '--add-correction',
+        type=str,
+        choices=['phonetic_dict', 'pattern', 'both'],
+        default=None,
+        help='Auto-apply corrections during extraction: phonetic_dict (dictionary-based), pattern (pattern-based), or both'
+    )
+
     args = parser.parse_args()
 
     # Parse page range
@@ -1744,7 +1806,7 @@ Examples:
         sys.exit(1)
 
     # Process folder using parallel mode
-    process_folder_parallel(folder_path, start_page, end_page, num_workers, dedup_window, output_folder_path)
+    process_folder_parallel(folder_path, start_page, end_page, num_workers, dedup_window, output_folder_path, args.add_correction)
 
 
 if __name__ == "__main__":

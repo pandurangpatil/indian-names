@@ -19,6 +19,9 @@ import traceback
 import time
 import config
 import unicodedata
+from indic_transliteration import sanscript
+from indic_transliteration.sanscript import SchemeMap, SCHEMES, transliterate
+import Levenshtein
 
 
 # OCR error correction dictionary
@@ -209,6 +212,7 @@ class ErrorLogger:
     def __init__(self, output_path: str):
         self.errors = []
         self.rejected_names = []
+        self.names_needing_review = []  # OCR-corrected names that need manual verification
         self.output_path = output_path
 
     def log_error(self, pdf_file: str, page_num: int, raw_text: str, reason: str):
@@ -229,9 +233,20 @@ class ErrorLogger:
             'reason': reason
         })
 
+    def log_name_needs_review(self, pdf_file: str, page_num: int, original_name: str,
+                               corrected_name: str, reason: str):
+        """Log a name that was partially corrected but needs manual review."""
+        self.names_needing_review.append({
+            'pdf_file': pdf_file,
+            'page_number': page_num,
+            'original_name': original_name,
+            'corrected_name': corrected_name,
+            'reason': reason
+        })
+
     def save(self):
         """Save errors and rejected names to file."""
-        if self.errors or self.rejected_names:
+        if self.errors or self.rejected_names or self.names_needing_review:
             with open(self.output_path, 'w', encoding='utf-8') as f:
                 f.write("=" * 80 + "\n")
                 f.write("EXTRACTION ERRORS AND REJECTED NAMES LOG\n")
@@ -260,14 +275,32 @@ class ErrorLogger:
                         f.write(f"Reason: {rejected['reason']}\n")
                         f.write("-" * 80 + "\n")
 
-            total = len(self.errors) + len(self.rejected_names)
+                if self.names_needing_review:
+                    f.write(f"\n\nNAMES NEEDING MANUAL REVIEW ({len(self.names_needing_review)} total)\n")
+                    f.write("=" * 80 + "\n")
+                    f.write("These names were partially corrected but require human verification\n\n")
+                    for idx, review_item in enumerate(self.names_needing_review, 1):
+                        f.write(f"\n--- Review Item #{idx} ---\n")
+                        f.write(f"File: {review_item['pdf_file']}\n")
+                        f.write(f"Page: {review_item['page_number']}\n")
+                        f.write(f"Original: {review_item['original_name']}\n")
+                        f.write(f"Corrected: {review_item['corrected_name']}\n")
+                        f.write(f"Reason: {review_item['reason']}\n")
+                        f.write("-" * 80 + "\n")
+
+            total = len(self.errors) + len(self.rejected_names) + len(self.names_needing_review)
             print(f"  ⚠ Logged {total} issues to: {self.output_path}")
+            if self.names_needing_review:
+                print(f"  📝 {len(self.names_needing_review)} names flagged for manual review")
 
 
 def extract_first_name(full_name: str) -> list:
     """
     Extract first name(s) from a full name based on word count rules.
     Returns a list of individual words to be written on separate lines.
+
+    NOTE: OCR correction is now done in post-processing via phonetic clustering,
+    not during extraction.
 
     Rules:
     - 1 word: return [word] (1 line)
@@ -286,8 +319,10 @@ def extract_first_name(full_name: str) -> list:
 
     if word_count == 0:
         return []
-    elif word_count == 1:
-        return [words[0]]
+
+    # Extract first name(s) based on word count (no correction applied here)
+    if word_count == 1:
+        return words
     elif word_count == 2:
         return [words[0]]
     elif word_count == 3:
@@ -364,6 +399,301 @@ def clean_name(name: str) -> str:
     name = re.sub(r'\s+', ' ', name).strip()
 
     return name
+
+
+def transliterate_to_latin(devanagari_text: str) -> str:
+    """
+    Transliterate Devanagari text to Latin script (ITRANS) for phonetic comparison.
+
+    Args:
+        devanagari_text: Text in Devanagari script
+
+    Returns:
+        Transliterated text in Latin script
+    """
+    try:
+        return transliterate(devanagari_text, sanscript.DEVANAGARI, sanscript.ITRANS)
+    except:
+        return devanagari_text
+
+
+def phonetic_similarity(name1: str, name2: str) -> float:
+    """
+    Calculate phonetic similarity between two names using transliteration distance.
+
+    Args:
+        name1: First name in Devanagari
+        name2: Second name in Devanagari
+
+    Returns:
+        Similarity score between 0 and 1 (1 = identical)
+    """
+    # Transliterate both to Latin for phonetic comparison
+    latin1 = transliterate_to_latin(name1).lower()
+    latin2 = transliterate_to_latin(name2).lower()
+
+    # Calculate Levenshtein distance
+    distance = Levenshtein.distance(latin1, latin2)
+    max_len = max(len(latin1), len(latin2))
+
+    if max_len == 0:
+        return 1.0
+
+    # Convert distance to similarity score (0-1)
+    similarity = 1.0 - (distance / max_len)
+    return similarity
+
+
+def build_phonetic_clusters(names_list: List[str], max_distance: int = 1) -> Dict[int, List[Tuple[str, str, int]]]:
+    """
+    Build clusters of phonetically similar names using transliteration + edit distance.
+
+    Strategy:
+    1. First group names by character length (only compare names of same/similar length)
+    2. Within each length group, cluster phonetically with strict threshold (distance ≤ 1)
+
+    Args:
+        names_list: List of unique names in Devanagari
+        max_distance: Maximum Levenshtein distance to consider names similar (default: 1)
+
+    Returns:
+        Dictionary mapping cluster_id to list of (name, latin_transliteration, count) tuples
+        Only returns clusters with more than one unique variant
+    """
+    from collections import Counter, defaultdict
+
+    # Count occurrences of each name
+    name_counts = Counter(names_list)
+    unique_names = list(name_counts.keys())
+
+    # Transliterate all names to Latin for comparison
+    name_to_latin = {}
+    for name in unique_names:
+        name_to_latin[name] = transliterate_to_latin(name).lower()
+
+    # STEP 1: Group names by transliterated length
+    names_by_length = defaultdict(list)
+    for name in unique_names:
+        latin = name_to_latin[name]
+        # Group by length, but allow ±1 character difference to catch minor variations
+        length_key = len(latin)
+        names_by_length[length_key].append(name)
+
+    # STEP 2: Within each length group, cluster phonetically
+    # Ensure ALL names in a cluster are within max_distance of EACH OTHER (not just the first)
+    clusters_list = []
+
+    for length, names_in_group in names_by_length.items():
+        if len(names_in_group) < 2:
+            continue  # No clustering needed for single name
+
+        processed = set()
+
+        for i, name1 in enumerate(names_in_group):
+            if name1 in processed:
+                continue
+
+            latin1 = name_to_latin[name1]
+            cluster = [(name1, latin1, name_counts[name1])]
+            cluster_latins = [latin1]  # Track all Latin transliterations in this cluster
+            processed.add(name1)
+
+            # Find all names similar to ALL names already in the cluster
+            for name2 in names_in_group[i+1:]:
+                if name2 in processed:
+                    continue
+
+                latin2 = name_to_latin[name2]
+
+                # Only cluster if lengths are very close (within 1 character)
+                len_diff = abs(len(latin1) - len(latin2))
+                if len_diff > 1:
+                    continue
+
+                # Check if name2 is within max_distance of ALL names in current cluster
+                is_close_to_all = True
+                for cluster_latin in cluster_latins:
+                    distance = Levenshtein.distance(cluster_latin, latin2)
+                    if distance > max_distance:
+                        is_close_to_all = False
+                        break
+
+                # Only add to cluster if close to ALL existing members
+                if is_close_to_all and len(cluster_latins) > 0:
+                    # Double-check at least one distance is > 0 (not exact match)
+                    min_dist = min(Levenshtein.distance(cl, latin2) for cl in cluster_latins)
+                    if min_dist > 0:
+                        cluster.append((name2, latin2, name_counts[name2]))
+                        cluster_latins.append(latin2)
+                        processed.add(name2)
+
+            # Only save clusters with more than one variant
+            if len(cluster) > 1:
+                # Sort by count (descending) so most common variant is first
+                cluster.sort(key=lambda x: x[2], reverse=True)
+                clusters_list.append(cluster)
+
+    # Convert to dictionary with IDs
+    variant_clusters = {i+1: cluster for i, cluster in enumerate(clusters_list)}
+    return variant_clusters
+
+
+def validate_devanagari_morphology(name: str) -> Tuple[bool, List[str]]:
+    """
+    Validate if a Devanagari name follows typical morphological patterns.
+
+    Args:
+        name: Name in Devanagari script
+
+    Returns:
+        Tuple of (is_valid, list_of_error_reasons)
+    """
+    error_reasons = []
+
+    if not name or len(name.strip()) == 0:
+        return False, ["Empty name"]
+
+    name = name.strip()
+
+    # Check 1: Starts with dependent vowel marks (these should never be at the start)
+    # Dependent vowels: ि ी ु ू ृ ॄ ॅ े ै ॉ ो ौ ं ः ् ँ
+    dependent_vowels = ['ि', 'ी', 'ु', 'ू', 'ृ', 'ॄ', 'ॅ', 'े', 'ै', 'ॉ', 'ो', 'ौ', 'ं', 'ः', '्', 'ँ']
+    if any(name.startswith(dv) for dv in dependent_vowels):
+        error_reasons.append(f"Starts with dependent vowel mark: '{name[0]}'")
+
+    # Check 2: Very short names (likely fragments)
+    if len(name) <= 2:
+        error_reasons.append(f"Very short ({len(name)} chars), likely fragment")
+
+    # Check 3: Ends with halant (्) without following consonant (incomplete word)
+    if name.endswith('्'):
+        error_reasons.append("Ends with halant (्), incomplete word")
+
+    # Check 4: Orphaned consonant clusters (प्पा, क्का without context)
+    # If name is just a consonant cluster with no other content
+    if len(name) <= 4 and '्' in name:
+        consonants_with_halant = name.count('्')
+        if consonants_with_halant >= len(name) / 2:
+            error_reasons.append("Appears to be orphaned consonant cluster")
+
+    # Check 5: Unusual symbols in wrong positions
+    # nukta (़) should only appear after specific consonants
+    if '़' in name:
+        # Check if nukta appears in isolation or at start
+        if name.startswith('़') or ' ़' in name:
+            error_reasons.append("Nukta (़) in invalid position")
+
+    # Check 6: Multiple spaces or special punctuation that indicates fragment
+    if '  ' in name or any(p in name for p in ['॰', '।', '॥']):
+        error_reasons.append("Contains unusual spacing or punctuation")
+
+    # Check 7: Contains only vowel marks (no consonants or independent vowels)
+    # Remove all dependent vowels and see if anything is left
+    temp = name
+    for dv in dependent_vowels:
+        temp = temp.replace(dv, '')
+    if len(temp.strip()) == 0:
+        error_reasons.append("Contains only vowel marks, no base characters")
+
+    is_valid = len(error_reasons) == 0
+    return is_valid, error_reasons
+
+
+def detect_ocr_pattern_errors(name: str) -> Tuple[List[str], str]:
+    """
+    Detect common OCR error patterns in Devanagari names WITHOUT auto-correcting.
+    This function only flags patterns that could be corrected, for post-clustering analysis.
+
+    Args:
+        name: Name string to analyze
+
+    Returns:
+        Tuple of (pattern_flags, suggested_correction)
+        - pattern_flags: List of pattern names that matched (e.g., ['ण्या→प्पा', 'त्त→त'])
+        - suggested_correction: What the corrected name would be (for display in error file)
+    """
+    if not name:
+        return [], ""
+
+    pattern_flags = []
+    suggested = name
+
+    # Pattern 1: ण्या/ण्पा/णप्पा → प्पा patterns (very common OCR error)
+    if 'ण्या' in name:
+        pattern_flags.append('ण्या→प्पा')
+        suggested = suggested.replace('ण्या', 'प्पा')
+    elif 'ण्पा' in name:
+        pattern_flags.append('ण्पा→प्पा')
+        suggested = suggested.replace('ण्पा', 'प्पा')
+    elif 'णप्पा' in name and not name.startswith('ण'):
+        pattern_flags.append('णप्पा→प्पा')
+        suggested = suggested.replace('णप्पा', 'प्पा')
+
+    # Pattern 2: ंवाण्या, ंधाण्या patterns
+    if 'ाण्' in name:
+        pattern_flags.append('ाण्→ाप्')
+        suggested = suggested.replace('ाण्या', 'ाप्पा').replace('ाण्पा', 'ाप्पा')
+
+    # Pattern 3: च → व at word end (common OCR confusion)
+    if name.endswith('च') and len(name) > 2:
+        if any(name.endswith(pattern) for pattern in ['राच', 'शीच', 'ाच', 'ीच']):
+            pattern_flags.append('च→व')
+            suggested = suggested[:-1] + 'व'
+
+    # Pattern 4: Trailing anusvara/chandrabindu
+    if name.endswith('ं'):
+        pattern_flags.append('trailing_ं')
+        suggested = suggested[:-1]
+
+    # Pattern 5: Common phonetic corrections dictionary
+    phonetic_corrections = {
+        'हणमंत': 'हनुमंत',
+        'हणमंता': 'हनुमंत',
+        'हणमाण्णा': 'हनुमान्ना',
+        'हृणमाण्णा': 'हनुमान्ना',
+        'किंरण': 'किरण',
+        'अजिंत': 'अजित',
+        'रंबिराज': 'रणबीरराज',
+        'रंबिंद्र': 'रवींद्र',
+        'सोम्लिंग': 'सोमलिंग',
+        'अनित्ता': 'अनिता',
+        'अनित्रा': 'अनिता',
+        'शशिक्तांत': 'शशिकांत',
+        'सांगेता': 'संगीता',
+        'माथुरी': 'माधुरी',
+        'शितल': 'शीतल',
+        'पोर्णिमा': 'पूर्णिमा',
+        'भींमा': 'भीमा',
+        'निल्लास': 'निलास',
+        'मोहून': 'मोहन',
+        'जवश्री': 'जयश्री',
+        'जवकुमार': 'जयकुमार',
+        'चूनुस': 'युनुस',
+        'पुस्तफा': 'मुस्तफा',
+        'जुयेर': 'जुबेर',
+        'रॉफेक': 'राफिक',
+        'शौकत्त': 'शौकत',
+        'यशवंत्त': 'यशवंत',
+        'जयवंत्त': 'जयवंत',
+        'हणमंत्त': 'हनुमंत',
+    }
+
+    if name in phonetic_corrections:
+        pattern_flags.append('phonetic_dict')
+        suggested = phonetic_corrections[name]
+
+    # Pattern 6: Suffix corrections
+    if name.endswith('त्त'):
+        pattern_flags.append('त्त→त')
+        suggested = suggested[:-2] + 'त'
+    elif name.endswith('राध'):
+        pattern_flags.append('राध→राम')
+        suggested = suggested[:-1] + 'म'
+    elif name.endswith('नाध'):
+        pattern_flags.append('नाध→नाथ')
+        suggested = suggested[:-1] + 'थ'
+
+    return pattern_flags, suggested
 
 
 def is_valid_devanagari_name(name: str) -> Tuple[bool, str]:
@@ -731,131 +1061,6 @@ def extract_voters_from_pdf(pdf_path: str, start_page: int, end_page: int, error
     return all_names
 
 
-def process_folder(folder_path: Path, start_page: int, end_page: int, output_file: str, output_folder: Path = None) -> None:
-    """
-    Process all PDF files in a folder and extract voter names.
-
-    Args:
-        folder_path: Path to folder containing PDF files
-        start_page: Starting page number for extraction
-        end_page: Ending page number for extraction
-        output_file: Output CSV filename
-        output_folder: Optional output folder path (default: None = use folder_path)
-    """
-    pdf_files = sorted(folder_path.glob("*.pdf"))
-
-    if not pdf_files:
-        print(f"✗ No PDF files found in: {folder_path}")
-        return
-
-    # Determine output location
-    if output_folder is None:
-        output_folder = folder_path
-    else:
-        output_folder.mkdir(parents=True, exist_ok=True)
-
-    # Update output file path to be in output folder
-    output_file = str(output_folder / Path(output_file).name)
-
-    print("=" * 80)
-    print(f"Maharashtra Voter Name Extractor - All Names")
-    print("=" * 80)
-    print(f"Folder: {folder_path}")
-    print(f"Output folder: {output_folder}")
-    print(f"Found {len(pdf_files)} PDF file(s)")
-    print(f"Extracting pages: {start_page} to {end_page}")
-    print(f"Output format: Plain text (one name per line)")
-    print(f"Validation: Strict Devanagari only")
-    print(f"Deduplication: Unicode NFD normalization")
-    print("=" * 80)
-
-    # Initialize error logger and duplicate tracker
-    error_file = output_file.replace('.txt', '_errors.txt').replace('.csv', '_errors.txt')
-    error_logger = ErrorLogger(error_file)
-    duplicate_tracker = DuplicateTracker()
-
-    all_names = []
-    successful = 0
-    failed = 0
-
-    for idx, pdf_file in enumerate(pdf_files, 1):
-        print(f"\n[{idx}/{len(pdf_files)}] Processing: {pdf_file.name}")
-        try:
-            names = extract_voters_from_pdf(str(pdf_file), start_page, end_page, error_logger, None)
-
-            if names:
-                all_names.extend(names)
-                print(f"  ✓ Extracted {len(names)} names")
-                successful += 1
-            else:
-                print(f"  ⚠ No names extracted")
-                failed += 1
-
-        except Exception as e:
-            print(f"  ✗ Error: {str(e)}")
-            error_logger.log_error(pdf_file.name, 0, "", f"PDF processing failed: {str(e)}")
-            failed += 1
-            continue
-
-    # Save error log
-    error_logger.save()
-
-    # Combine all results and remove duplicates using normalization
-    if all_names:
-        initial_count = len(all_names)
-
-        # Remove duplicates using Unicode normalization
-        unique_names = []
-        for name in all_names:
-            if duplicate_tracker.add_name(name):
-                unique_names.append(name)
-
-        duplicates_removed = initial_count - len(unique_names)
-
-        # Save to TXT file
-        with open(output_file, 'w', encoding='utf-8') as f:
-            for name in unique_names:
-                f.write(name + '\n')
-
-        # Extract and save only first names (flatten list of lists)
-        only_names_file = output_file.replace('extracted_names_', 'only_names_')
-        extracted_first_names = []
-        for name in unique_names:
-            name_words = extract_first_name(name)
-            extracted_first_names.extend(name_words)
-
-        with open(only_names_file, 'w', encoding='utf-8') as f:
-            for name in extracted_first_names:
-                if name:  # Only write non-empty names
-                    f.write(name + '\n')
-
-        # Save duplicate report
-        duplicates_file = output_file.replace('.txt', '_duplicates_report.txt')
-        duplicate_tracker.save_report(duplicates_file)
-
-        print("\n" + "=" * 80)
-        print("EXTRACTION COMPLETE")
-        print("=" * 80)
-        print(f"✓ Total PDFs processed: {successful}")
-        print(f"✗ Failed: {failed}")
-        print(f"✓ Total names extracted: {initial_count}")
-        print(f"✓ Duplicates removed: {duplicates_removed}")
-        print(f"✓ Unique names: {len(unique_names)}")
-        print(f"✓ Output saved to: {output_file}")
-        print(f"✓ First names saved to: {only_names_file} ({len(extracted_first_names)} words)")
-        print(f"✓ Duplicates report: {duplicates_file}")
-        print("=" * 80)
-
-        # Display sample
-        print("\nSample of extracted names (first 15):")
-        print("-" * 80)
-        for name in unique_names[:15]:
-            print(f"  {name}")
-        print("-" * 80)
-
-    else:
-        print("\n✗ No names were extracted from any PDF files.")
-
 
 def file_worker_process(pdf_path: str, start_page: int, end_page: int,
                        names_queue: multiprocessing.Queue,
@@ -887,7 +1092,7 @@ def file_worker_process(pdf_path: str, start_page: int, end_page: int,
 
         # Push each name to the queue with metadata
         for name in names:
-            # Extract first name(s) - returns a list
+            # Extract first name(s) - now returns just a list (no correction at this stage)
             first_names = extract_first_name(name)
 
             # Push full name
@@ -899,6 +1104,7 @@ def file_worker_process(pdf_path: str, start_page: int, end_page: int,
             })
 
             # Push first name(s) if they exist
+            # Note: Validation and correction now happens in post-processing
             if first_names:
                 for first_name in first_names:
                     names_queue.put({
@@ -941,6 +1147,9 @@ def name_writer_process(names_queue: multiprocessing.Queue,
     """
     Dedicated process for writing names to files with deduplication.
 
+    Creates a single global only_names.txt file with cross-file deduplication,
+    while maintaining per-PDF extracted_names.txt files.
+
     Args:
         names_queue: Queue from which to read extracted names
         error_queue: Queue to monitor worker completion
@@ -949,13 +1158,24 @@ def name_writer_process(names_queue: multiprocessing.Queue,
         dedup_window_size: Size of the sliding window for duplicate detection
     """
     try:
-        # Track file handles, deduplication windows, and duplicate trackers for each PDF
+        # Track file handles for per-PDF full names
         file_handles: Dict[str, Dict[str, any]] = {}
+
+        # Global first names collection (IN MEMORY - don't write file yet)
+        global_first_names_list = []  # Collect all names in memory
+        global_first_names_window = deque(maxlen=dedup_window_size)
+        global_first_names_tracker = DuplicateTracker()
+        global_first_count = 0
+
+        # Track which PDFs contributed each first name (for cross-file statistics)
+        first_name_sources: Dict[str, Set[str]] = {}  # normalized_name -> set of pdf_files
+
         error_logs_to_consolidate: Dict[str, List[str]] = {}  # pdf_file -> list of error log paths
         completed_workers = 0
         total_names_written = 0
 
         print(f"[Name Writer] Started (window size: {dedup_window_size}, normalization: NFD)")
+        print(f"[Name Writer] Collecting names in memory for validation (not writing yet)")
 
         while completed_workers < num_workers:
             try:
@@ -984,22 +1204,17 @@ def name_writer_process(names_queue: multiprocessing.Queue,
                     name = name_data['name']
                     name_type = name_data['type']
 
-                    # Initialize file handles and dedup window for this PDF if not exists
+                    # Initialize file handles for this PDF if not exists (only full names per-PDF)
                     if pdf_file not in file_handles:
                         full_names_file = str(output_dir / f"{pdf_file}_extracted_names.txt")
-                        first_names_file = str(output_dir / f"{pdf_file}_only_names.txt")
 
                         file_handles[pdf_file] = {
                             'full_handle': open(full_names_file, 'w', encoding='utf-8'),
-                            'first_handle': open(first_names_file, 'w', encoding='utf-8'),
                             'full_window': deque(maxlen=dedup_window_size),
-                            'first_window': deque(maxlen=dedup_window_size),
                             'full_count': 0,
-                            'first_count': 0,
-                            'full_tracker': DuplicateTracker(),
-                            'first_tracker': DuplicateTracker()
+                            'full_tracker': DuplicateTracker()
                         }
-                        print(f"[Name Writer] Created output files for: {pdf_file}")
+                        print(f"[Name Writer] Created full names output file for: {pdf_file}")
 
                     handles = file_handles[pdf_file]
 
@@ -1015,13 +1230,24 @@ def name_writer_process(names_queue: multiprocessing.Queue,
                             total_names_written += 1
 
                     elif name_type == 'first':
+                        # Collect first names in memory (don't write to file yet)
                         normalized = normalize_devanagari(name)
-                        if normalized not in handles['first_window']:
-                            handles['first_handle'].write(name + '\n')
-                            handles['first_handle'].flush()  # Ensure immediate write
-                            handles['first_window'].append(normalized)
-                            handles['first_tracker'].add_name(name)
-                            handles['first_count'] += 1
+                        if normalized not in global_first_names_window:
+                            # Store in memory instead of writing to file
+                            global_first_names_list.append(name)
+                            global_first_names_window.append(normalized)
+                            global_first_names_tracker.add_name(name)
+                            global_first_count += 1
+
+                            # Track which PDF this name came from
+                            if normalized not in first_name_sources:
+                                first_name_sources[normalized] = set()
+                            first_name_sources[normalized].add(pdf_file)
+                        else:
+                            # Name already exists, track cross-file duplicate
+                            if normalized not in first_name_sources:
+                                first_name_sources[normalized] = set()
+                            first_name_sources[normalized].add(pdf_file)
 
                 except multiprocessing.queues.Empty:
                     # Queue is empty, continue checking for completion
@@ -1040,25 +1266,38 @@ def name_writer_process(names_queue: multiprocessing.Queue,
                 pdf_file = name_data['pdf_file']
                 name = name_data['name']
                 name_type = name_data['type']
+                normalized = normalize_devanagari(name)
 
-                if pdf_file in file_handles:
-                    handles = file_handles[pdf_file]
-                    normalized = normalize_devanagari(name)
+                if name_type == 'full':
+                    # Full names require per-PDF file handles
+                    if pdf_file in file_handles:
+                        handles = file_handles[pdf_file]
+                        if normalized not in handles['full_window']:
+                            handles['full_handle'].write(name + '\n')
+                            handles['full_window'].append(normalized)
+                            handles['full_tracker'].add_name(name)
+                            handles['full_count'] += 1
+                            total_names_written += 1
+                            remaining_count += 1
 
-                    if name_type == 'full' and normalized not in handles['full_window']:
-                        handles['full_handle'].write(name + '\n')
-                        handles['full_window'].append(normalized)
-                        handles['full_tracker'].add_name(name)
-                        handles['full_count'] += 1
-                        total_names_written += 1
+                elif name_type == 'first':
+                    # Collect first names in memory (don't write to file yet)
+                    if normalized not in global_first_names_window:
+                        global_first_names_list.append(name)
+                        global_first_names_window.append(normalized)
+                        global_first_names_tracker.add_name(name)
+                        global_first_count += 1
                         remaining_count += 1
 
-                    elif name_type == 'first' and normalized not in handles['first_window']:
-                        handles['first_handle'].write(name + '\n')
-                        handles['first_window'].append(normalized)
-                        handles['first_tracker'].add_name(name)
-                        handles['first_count'] += 1
-                        remaining_count += 1
+                        # Track source PDF
+                        if normalized not in first_name_sources:
+                            first_name_sources[normalized] = set()
+                        first_name_sources[normalized].add(pdf_file)
+                    else:
+                        # Track cross-file duplicate even if not collecting
+                        if normalized not in first_name_sources:
+                            first_name_sources[normalized] = set()
+                        first_name_sources[normalized].add(pdf_file)
 
             except:
                 break
@@ -1066,25 +1305,10 @@ def name_writer_process(names_queue: multiprocessing.Queue,
         if remaining_count > 0:
             print(f"[Name Writer] Processed {remaining_count} remaining names")
 
-        # Consolidate error logs and generate reports
-        print("\n[Name Writer] Consolidating error logs and generating reports...")
+        # Clean up temporary error logs (if any)
+        print("\n[Name Writer] Cleaning up temporary error logs...")
         for pdf_file, error_log_paths in error_logs_to_consolidate.items():
             if error_log_paths:
-                consolidated_error_file = str(output_dir / f"{pdf_file}_errors.txt")
-
-                # Read and consolidate all error logs
-                with open(consolidated_error_file, 'w', encoding='utf-8') as out_f:
-                    for error_log_path in error_log_paths:
-                        try:
-                            with open(error_log_path, 'r', encoding='utf-8') as in_f:
-                                out_f.write(in_f.read())
-                                out_f.write("\n" + "=" * 80 + "\n")
-                        except Exception as e:
-                            print(f"[Name Writer] Warning: Could not read error log {error_log_path}: {e}")
-
-                print(f"  ✓ Consolidated error log: {consolidated_error_file}")
-
-                # Clean up temporary error logs
                 for error_log_path in error_log_paths:
                     try:
                         Path(error_log_path).unlink()
@@ -1095,34 +1319,217 @@ def name_writer_process(names_queue: multiprocessing.Queue,
         print("\n" + "=" * 80)
         print("NAME WRITER SUMMARY")
         print("=" * 80)
+
+        # Per-PDF full names summary
         for pdf_file, handles in file_handles.items():
             print(f"\n{pdf_file}:")
             print(f"  Full names: {handles['full_count']}")
-            print(f"  First names: {handles['first_count']}")
 
             # Close file handles
             handles['full_handle'].close()
-            handles['first_handle'].close()
 
-            # Generate duplicate reports
+            # Generate duplicate report for full names
             full_dup_report = str(output_dir / f"{pdf_file}_extracted_names_duplicates_report.txt")
-            first_dup_report = str(output_dir / f"{pdf_file}_only_names_duplicates_report.txt")
-
             handles['full_tracker'].save_report(full_dup_report)
-            handles['first_tracker'].save_report(first_dup_report)
 
-        print(f"\nTotal names written: {total_names_written}")
+        # Global first names summary (before validation)
+        print(f"\n{'Global First Names (collected in memory)':}")
+        print(f"  Total unique first names collected: {global_first_count}")
+
+        # Calculate cross-file duplicate statistics
+        cross_file_names = {name: sources for name, sources in first_name_sources.items() if len(sources) > 1}
+        print(f"  Names appearing in multiple PDFs: {len(cross_file_names)}")
+
+        # ========================================================================
+        # VALIDATION: Validate ALL names before writing to file
+        # ========================================================================
+        print("\n" + "=" * 80)
+        print("VALIDATION: Analyzing all names before writing to only_names.txt")
+        print("=" * 80)
+
+        # Use the collected names from memory
+        all_names = global_first_names_list
+        print(f"[Validation] Analyzing {len(all_names)} unique names...")
+
+        # Step 1: Build phonetic clusters (edit distance ≤ 1, grouped by length)
+        print("[Post-Processing] Building phonetic clusters (grouped by length, distance ≤ 1)...")
+        phonetic_clusters = build_phonetic_clusters(all_names, max_distance=1)
+        print(f"  ✓ Found {len(phonetic_clusters)} phonetic variant clusters")
+
+        # Step 2: Validate Devanagari morphology for all names
+        print("[Post-Processing] Validating Devanagari morphology...")
+        morphologically_invalid = []
+        for name in all_names:
+            is_valid, error_reasons = validate_devanagari_morphology(name)
+            if not is_valid:
+                morphologically_invalid.append((name, error_reasons))
+        print(f"  ✓ Found {len(morphologically_invalid)} morphologically invalid names")
+
+        # Step 3: Detect OCR pattern errors
+        print("[Validation] Detecting OCR pattern errors...")
+        pattern_errors = []
+        for name in all_names:
+            pattern_flags, suggested = detect_ocr_pattern_errors(name)
+            if pattern_flags:
+                pattern_errors.append((name, pattern_flags, suggested))
+        print(f"  ✓ Found {len(pattern_errors)} names with OCR pattern errors")
+
+        # Step 4: Collect ALL invalid names
+        print("\n[Validation] Determining which names to exclude from only_names.txt...")
+        invalid_names_set = set()
+
+        # Add all names from phonetic clusters (all variants need review)
+        for cluster_id, variants in phonetic_clusters.items():
+            for name, latin, count in variants:
+                invalid_names_set.add(name)
+
+        # Add morphologically invalid names
+        for name, reasons in morphologically_invalid:
+            invalid_names_set.add(name)
+
+        # Add pattern error names
+        for name, flags, suggested in pattern_errors:
+            invalid_names_set.add(name)
+
+        # Step 5: Split names into valid vs invalid
+        valid_names = [name for name in all_names if name not in invalid_names_set]
+        invalid_count = len(all_names) - len(valid_names)
+
+        print(f"  ✓ Total names analyzed: {len(all_names)}")
+        print(f"  ✓ Valid names (will write to only_names.txt): {len(valid_names)}")
+        print(f"  ✓ Invalid names (will write to error file): {invalid_count}")
+
+        # Step 6: Write only_names.txt with VALID names only
+        only_names_file = str(output_dir / "only_names.txt")
+        print(f"\n[Validation] Writing only_names.txt with {len(valid_names)} valid names...")
+        with open(only_names_file, 'w', encoding='utf-8') as f:
+            for name in valid_names:
+                f.write(name + '\n')
+        print(f"  ✓ only_names.txt written successfully")
+
+        # Generate consolidated error file with 3 sections
+        only_names_errors_file = str(output_dir / "only_names_errors.txt")
+        total_flagged = len(phonetic_clusters) + len(morphologically_invalid) + len(pattern_errors)
+
+        print(f"\n[Validation] Generating error report with {invalid_count} invalid names...")
+        with open(only_names_errors_file, 'w', encoding='utf-8') as f:
+            f.write("=" * 80 + "\n")
+            f.write("CONSOLIDATED NAMES NEEDING MANUAL REVIEW\n")
+            f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("=" * 80 + "\n\n")
+            f.write(f"Total items flagged: {total_flagged}\n")
+            f.write(f"  - Phonetic variant clusters: {len(phonetic_clusters)}\n")
+            f.write(f"  - Morphologically invalid: {len(morphologically_invalid)}\n")
+            f.write(f"  - Pattern-based corrections: {len(pattern_errors)}\n")
+            f.write("\n")
+
+            # ---- SECTION 1: Phonetic Variants ----
+            f.write("=" * 80 + "\n")
+            f.write("SECTION 1: PHONETIC VARIANTS\n")
+            f.write("=" * 80 + "\n")
+            f.write("These names are phonetically similar (grouped by length, edit distance ≤ 1).\n")
+            f.write("Review to determine which variant is correct.\n\n")
+
+            if phonetic_clusters:
+                for cluster_id, variants in sorted(phonetic_clusters.items()):
+                    f.write(f"--- Cluster #{cluster_id} ({len(variants)} variants) ---\n")
+
+                    # Show all variants with their counts and transliterations
+                    for name, latin, count in variants:
+                        f.write(f"  • {name} → [{latin}] (appears {count} times)\n")
+
+                    # Calculate edit distances between variants
+                    if len(variants) > 1:
+                        f.write(f"  Edit distances:\n")
+                        for i in range(len(variants) - 1):
+                            name1, latin1, _ = variants[i]
+                            name2, latin2, _ = variants[i + 1]
+                            distance = Levenshtein.distance(latin1, latin2)
+                            f.write(f"    {latin1} ↔ {latin2} = {distance}\n")
+
+                    f.write("-" * 80 + "\n")
+            else:
+                f.write("  (No phonetic variants found)\n\n")
+
+            # ---- SECTION 2: Morphologically Invalid ----
+            f.write("\n" + "=" * 80 + "\n")
+            f.write("SECTION 2: MORPHOLOGICALLY INVALID\n")
+            f.write("=" * 80 + "\n")
+            f.write("These names violate Devanagari morphology rules.\n")
+            f.write("They may be OCR errors, fragments, or require correction.\n\n")
+
+            if morphologically_invalid:
+                for idx, (name, error_reasons) in enumerate(morphologically_invalid, 1):
+                    f.write(f"--- Item #{idx} ---\n")
+                    f.write(f"  Name: {name}\n")
+                    f.write(f"  Issues:\n")
+                    for reason in error_reasons:
+                        f.write(f"    - {reason}\n")
+                    f.write("-" * 80 + "\n")
+            else:
+                f.write("  (No morphologically invalid names found)\n\n")
+
+            # ---- SECTION 3: Pattern-Based Corrections ----
+            f.write("\n" + "=" * 80 + "\n")
+            f.write("SECTION 3: PATTERN-BASED CORRECTIONS\n")
+            f.write("=" * 80 + "\n")
+            f.write("These names match known OCR error patterns.\n")
+            f.write("Suggested corrections are provided (applied AFTER phonetic clustering).\n\n")
+
+            if pattern_errors:
+                for idx, (name, pattern_flags, suggested) in enumerate(pattern_errors, 1):
+                    f.write(f"--- Item #{idx} ---\n")
+                    f.write(f"  Original: {name}\n")
+                    f.write(f"  Suggested: {suggested}\n")
+                    f.write(f"  Patterns: {', '.join(pattern_flags)}\n")
+                    f.write("-" * 80 + "\n")
+            else:
+                f.write("  (No pattern-based errors found)\n\n")
+
+        print(f"  ✓ Error report generated: {only_names_errors_file}")
+        print(f"  ✓ Total items flagged: {total_flagged}")
+
+        # Generate global first names duplicate report with cross-file statistics
+        global_first_dup_report = str(output_dir / "only_names_duplicates_report.txt")
+        global_first_names_tracker.save_report(global_first_dup_report)
+
+        # Generate cross-file statistics report
+        if cross_file_names:
+            cross_file_report = str(output_dir / "only_names_cross_file_report.txt")
+            with open(cross_file_report, 'w', encoding='utf-8') as f:
+                f.write("=" * 80 + "\n")
+                f.write("CROSS-FILE FIRST NAMES REPORT\n")
+                f.write("=" * 80 + "\n\n")
+                f.write(f"Names appearing in multiple PDF files: {len(cross_file_names)}\n\n")
+
+                # Sort by number of PDFs (descending) then by name
+                sorted_names = sorted(cross_file_names.items(),
+                                    key=lambda x: (-len(x[1]), x[0]))
+
+                for normalized_name, pdf_sources in sorted_names:
+                    f.write(f"\n{normalized_name}\n")
+                    f.write(f"  Found in {len(pdf_sources)} PDF(s):\n")
+                    for pdf in sorted(pdf_sources):
+                        f.write(f"    - {pdf}\n")
+
+            print(f"\n  Cross-file report generated: {cross_file_report}")
+
+            # Show top 5 most common cross-file names
+            print(f"\n  Top names appearing in multiple PDFs:")
+            for normalized_name, pdf_sources in sorted_names[:5]:
+                print(f"    {normalized_name}: {len(pdf_sources)} PDFs")
+
+        print(f"\nTotal full names written: {total_names_written}")
         print("=" * 80)
 
     except Exception as e:
         print(f"[Name Writer] Fatal error: {str(e)}")
         print(traceback.format_exc())
     finally:
-        # Ensure all handles are closed
+        # Ensure all file handles are closed
         for handles in file_handles.values():
             try:
                 handles['full_handle'].close()
-                handles['first_handle'].close()
             except:
                 pass
 
@@ -1246,18 +1653,17 @@ def process_folder_parallel(folder_path: Path, start_page: int, end_page: int,
 def main():
     """Main function with CLI argument parsing."""
     parser = argparse.ArgumentParser(
-        description='Extract voter names from Maharashtra voters list PDFs (Devanagari script)',
+        description='Extract voter names from Maharashtra voters list PDFs (Devanagari script) using parallel processing',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Parallel processing (default, per-file output)
-  %(prog)s --folder /path/to/pdfs
-  %(prog)s -f ./pdfs --pages 3-32
-  %(prog)s -f ./pdfs --workers 4 --dedup-window 500
+  # Basic usage
+  %(prog)s -f ./pdfs
+  %(prog)s -f /path/to/pdfs -o ./output
 
-  # Sequential processing (original behavior, single output file)
-  %(prog)s -f ./pdfs --no-parallel --output names.txt
-  %(prog)s -f . --no-parallel --output names.txt --pages 3-32
+  # Custom options
+  %(prog)s -f ./pdfs -o ./results --pages 3-32
+  %(prog)s -f ./pdfs -o ./output --workers 4 --dedup-window 500
         """
     )
 
@@ -1272,14 +1678,7 @@ Examples:
         '-o', '--output',
         type=str,
         default=None,
-        help='Output TXT filename (default: extracted_names_<timestamp>.txt). Creates both extracted_names and only_names files. Only used in sequential mode.'
-    )
-
-    parser.add_argument(
-        '--output-folder',
-        type=str,
-        default=None,
-        help='Output folder for all generated files (default: ./output in current directory). If not specified, files are saved in the input folder.'
+        help='Output folder path for all generated files (default: ./output). All output files including only_names.txt, per-PDF files, and error files will be written here.'
     )
 
     parser.add_argument(
@@ -1290,24 +1689,10 @@ Examples:
     )
 
     parser.add_argument(
-        '--parallel',
-        action='store_true',
-        default=True,
-        help='Use parallel processing (default: enabled)'
-    )
-
-    parser.add_argument(
-        '--no-parallel',
-        action='store_true',
-        default=False,
-        help='Disable parallel processing (use sequential mode)'
-    )
-
-    parser.add_argument(
         '-w', '--workers',
         type=int,
         default=None,
-        help=f'Number of worker processes (default: CPU count - 1 = {config.NUM_WORKERS})'
+        help=f'Number of parallel worker processes (default: CPU count - 1 = {config.NUM_WORKERS})'
     )
 
     parser.add_argument(
@@ -1328,14 +1713,7 @@ Examples:
         print("✗ Error: Invalid page range. Use format: START-END (e.g., 3-32)")
         sys.exit(1)
 
-    # Set output filename
-    if args.output:
-        output_file = args.output
-    else:
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        output_file = f"extracted_names_{timestamp}.txt"
-
-    # Get folder path
+    # Get input folder path
     folder_path = Path(args.folder).resolve()
     if not folder_path.exists():
         print(f"✗ Error: Folder does not exist: {folder_path}")
@@ -1345,40 +1723,28 @@ Examples:
         print(f"✗ Error: Path is not a directory: {folder_path}")
         sys.exit(1)
 
-    # Determine output folder
-    if args.output_folder:
-        output_folder_path = Path(args.output_folder).resolve()
+    # Determine output folder path
+    if args.output:
+        output_folder_path = Path(args.output).resolve()
     else:
         # Default to ./output in current directory
         output_folder_path = Path.cwd() / 'output'
 
-    # Determine processing mode
-    use_parallel = args.parallel and not args.no_parallel
+    # Set worker and deduplication parameters
+    num_workers = args.workers if args.workers else config.NUM_WORKERS
+    dedup_window = args.dedup_window if args.dedup_window else config.DEDUP_WINDOW_SIZE
 
-    # Process folder
-    if use_parallel:
-        # Use parallel processing
-        num_workers = args.workers if args.workers else config.NUM_WORKERS
-        dedup_window = args.dedup_window if args.dedup_window else config.DEDUP_WINDOW_SIZE
+    # Validate parameters
+    if num_workers < 1:
+        print("✗ Error: Number of workers must be at least 1")
+        sys.exit(1)
 
-        # Validate workers count
-        if num_workers < 1:
-            print("✗ Error: Number of workers must be at least 1")
-            sys.exit(1)
+    if dedup_window < 1:
+        print("✗ Error: Deduplication window size must be at least 1")
+        sys.exit(1)
 
-        # Validate dedup window
-        if dedup_window < 1:
-            print("✗ Error: Deduplication window size must be at least 1")
-            sys.exit(1)
-
-        process_folder_parallel(folder_path, start_page, end_page, num_workers, dedup_window, output_folder_path)
-    else:
-        # Use sequential processing (original behavior)
-        print("\n" + "=" * 80)
-        print("SEQUENTIAL PROCESSING MODE")
-        print("=" * 80 + "\n")
-
-        process_folder(folder_path, start_page, end_page, output_file, output_folder_path)
+    # Process folder using parallel mode
+    process_folder_parallel(folder_path, start_page, end_page, num_workers, dedup_window, output_folder_path)
 
 
 if __name__ == "__main__":

@@ -17,17 +17,19 @@ The voter name extraction tool now supports parallel processing to significantly
 - Real-time writing as names are extracted
 
 ### 3. Sliding Window Deduplication
-- Each output file maintains its own sliding window for duplicate detection
+- **Full names**: Per-PDF sliding window for duplicate detection
+- **First names**: Single global sliding window with cross-file deduplication
 - Configurable window size (default: 1000 names)
 - More efficient than end-of-processing global deduplication
-- Names are checked against the last N names already written to the file
+- Names are checked against the last N names already written
 
-### 4. Per-File Output Mapping
-- Each input PDF generates separate output files:
-  - `{pdf_basename}_extracted_names.txt` - Full names
-  - `{pdf_basename}_only_names.txt` - First names only
-- Easy traceability from input to output
-- Better organization for large batches
+### 4. Output File Structure
+- **Per-PDF files**:
+  - `{pdf_basename}_extracted_names.txt` - Full names (unique per PDF)
+- **Global files**:
+  - `only_names.txt` - First names only (deduplicated across all PDFs)
+- Easy traceability from input to output for full names
+- Single consolidated first names file prevents cross-file duplicates
 
 ## Usage
 
@@ -84,8 +86,10 @@ QUEUE_TIMEOUT = 1               # Seconds
 ```
 Main Process
 ├── Name Writer Process (single)
-│   ├── Manages all file handles
-│   ├── Maintains per-file deduplication windows
+│   ├── Manages per-PDF full name file handles
+│   ├── Manages global first names file (only_names.txt)
+│   ├── Maintains per-PDF deduplication windows for full names
+│   ├── Maintains global deduplication window for first names
 │   └── Writes names in real-time
 │
 └── File Worker Processes (configurable)
@@ -104,12 +108,21 @@ File Workers → Error Queue → Main Process → Console
 
 ### Deduplication Logic
 
-For each PDF file, the name writer maintains:
-- **Full Names Window**: Last 1000 full names written for this PDF
-- **First Names Window**: Last 1000 first names written for this PDF
+The name writer maintains separate deduplication strategies:
+
+**For Full Names (Per-PDF)**:
+- Each PDF maintains its own window of the last 1000 full names
+- Duplicates are only checked within the same PDF
+- Written to `{pdf_basename}_extracted_names.txt`
+
+**For First Names (Global)**:
+- Single global window of the last 1000 first names across all PDFs
+- Duplicates are checked across all source PDFs
+- Written to single `only_names.txt` file
+- Tracks which PDFs contributed each name for cross-file statistics
 
 When a new name arrives:
-1. Check if it exists in the corresponding window
+1. Check if it exists in the corresponding window (per-PDF for full, global for first)
 2. If not found, write to file and add to window
 3. If found, skip (it's a duplicate within the window)
 
@@ -142,8 +155,15 @@ Expected speedup:
 
 For each input PDF `filename.pdf`, creates:
 ```
-filename_extracted_names.txt    # Full names
-filename_only_names.txt         # First names only
+filename_extracted_names.txt              # Full names (per-PDF)
+filename_extracted_names_duplicates_report.txt  # Duplicate report for full names
+```
+
+Additionally, creates global files:
+```
+only_names.txt                            # First names (deduplicated across all PDFs)
+only_names_duplicates_report.txt          # Duplicate report for first names
+only_names_cross_file_report.txt          # Report showing names appearing in multiple PDFs
 ```
 
 ### Sequential Mode
@@ -188,11 +208,15 @@ python extract_voter_names.py -f ./pdfs --pages 3-32
 
 Output:
 ```
+# Per-PDF files
 2024-EROLLGEN-S13-282-FinalRoll-Revision1-MAR-1-WI_extracted_names.txt
-2024-EROLLGEN-S13-282-FinalRoll-Revision1-MAR-1-WI_only_names.txt
 2024-EROLLGEN-S13-287-FinalRoll-Revision1-MAR-190-WI_extracted_names.txt
-2024-EROLLGEN-S13-287-FinalRoll-Revision1-MAR-190-WI_only_names.txt
 ...
+
+# Global files
+only_names.txt                       # All first names, deduplicated across PDFs
+only_names_duplicates_report.txt     # Duplicate statistics
+only_names_cross_file_report.txt     # Names appearing in multiple PDFs
 ```
 
 ### Example 2: Limited Workers for Background Processing
@@ -231,7 +255,7 @@ Uses the original sequential processing and combines all names into a single fil
 
 ### Issue: "Too many open files" error
 
-**Cause**: Each PDF requires 2 file handles (full names + first names)
+**Cause**: Each PDF requires 1 file handle (full names), plus 1 global handle (first names)
 
 **Solution**:
 - Reduce number of workers: `--workers 2`
@@ -265,8 +289,9 @@ Uses the original sequential processing and combines all names into a single fil
 | Feature | Parallel Mode | Sequential Mode |
 |---------|--------------|-----------------|
 | **Speed** | 4-8x faster | Baseline |
-| **Output** | Per-file | Single combined |
-| **Deduplication** | Per-file, sliding window | Global, at end |
+| **Output** | Per-PDF full names + Global first names | Single combined |
+| **Deduplication** | Per-PDF for full, Global for first | Global, at end |
+| **Cross-file Dedup** | Yes (first names) | Yes |
 | **Memory** | Higher | Lower |
 | **Traceability** | Excellent | Good |
 | **Resumability** | Can reprocess failed files | Must restart all |

@@ -5,6 +5,8 @@
 pdfplumber==0.11.8      # PDF text extraction with spatial awareness
 pytesseract==0.3.13     # Python wrapper for Tesseract OCR
 Pillow==12.0.0          # Image processing for OCR
+indic-transliteration==2.3.60  # Devanagari transliteration for phonetic matching
+python-Levenshtein==0.25.1     # Fast edit distance calculation for name similarity
 
 # Built-in Python modules used (no installation required):
 # - unicodedata: For Devanagari text normalization and duplicate detection
